@@ -1,0 +1,1 @@
+autoflyer/arquivo.psd/*.psd filter=lfs diff=lfs merge=lfs -text

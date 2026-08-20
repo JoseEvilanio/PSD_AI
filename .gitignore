@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.log
+autoflyer/logs/*
+autoflyer/data/outputs/*
+autoflyer/data/products/*
+autoflyer/data/inputs/*
+!autoflyer/data/inputs/example_offers.csv
+!autoflyer/data/inputs/example_offers.xlsx
+*.jpg
+*.jpeg
+*.png
+*.tmp
