@@ -227,6 +227,53 @@ class PhotoshopEngine:
             return None
         return None
 
+    def _wait_for_update(self, delay: float = 1.0) -> None:
+        """Allow Photoshop to finish asynchronous layer updates before continuing."""
+        time.sleep(delay)
+        if self.app is None:
+            return
+        try:
+            self.app.DoJavaScript("app.refresh();")
+            time.sleep(0.25)
+        except Exception:
+            logger.debug("Photoshop refresh is unavailable; continuing after delay.", exc_info=True)
+
+    def _fit_layer_to_bounds(self, layer: Any, target: tuple[float, float, float, float]) -> None:
+        target_left, target_top, target_right, target_bottom = target
+        target_width = max(target_right - target_left, 1.0)
+        target_height = max(target_bottom - target_top, 1.0)
+        target_center_x = (target_left + target_right) / 2.0
+        target_center_y = (target_top + target_bottom) / 2.0
+
+        layer_id = int(getattr(layer, "ID"))
+        script = (
+            "function findLayer(container, targetId) {"
+            "  for (var i = 0; i < container.layers.length; i++) {"
+            "    var candidate = container.layers[i];"
+            "    if (candidate.id == targetId) return candidate;"
+            "    if (candidate.typename == 'LayerSet') {"
+            "      var nested = findLayer(candidate, targetId);"
+            "      if (nested) return nested;"
+            "    }"
+            "  }"
+            "  return null;"
+            "}"
+            "function px(value) { return value.as('px'); }"
+            "var fittedLayer = findLayer(app.activeDocument, " + str(layer_id) + ");"
+            "if (!fittedLayer) throw new Error('Layer not found for fitting');"
+            "var bounds = fittedLayer.bounds;"
+            "var width = Math.max(px(bounds[2]) - px(bounds[0]), 1);"
+            "var height = Math.max(px(bounds[3]) - px(bounds[1]), 1);"
+            "var scale = Math.min(" + str(target_width) + " / width, " + str(target_height) + " / height) * 100;"
+            "if (Math.abs(scale - 100) > 0.1) fittedLayer.resize(scale, scale, AnchorPosition.MIDDLECENTER);"
+            "bounds = fittedLayer.bounds;"
+            "var centerX = (px(bounds[0]) + px(bounds[2])) / 2;"
+            "var centerY = (px(bounds[1]) + px(bounds[3])) / 2;"
+            "fittedLayer.translate(new UnitValue(" + str(target_center_x) + " - centerX, 'px'), "
+            "new UnitValue(" + str(target_center_y) + " - centerY, 'px'));"
+        )
+        self.app.DoJavaScript(script)
+
     def replace_smart_object(self, layer_name: str, image_path: str | Path) -> bool:
         if self.app is None:
             logger.info("Stub mode: smart object '%s' would be replaced with %s", layer_name, image_path)
@@ -245,25 +292,46 @@ class PhotoshopEngine:
             logger.warning("Failed to replace smart object '%s': %s", layer_name, exc)
             return False
 
-    def _replace_smart_object_layer(self, doc: Any, layer: Any, image_path: str | Path) -> bool:
+    def _replace_smart_object_layer(
+        self,
+        doc: Any,
+        layer: Any,
+        image_path: str | Path,
+        original_bounds: Optional[tuple[float, float, float, float]] = None,
+    ) -> bool:
         try:
             if int(getattr(layer, "Kind", 0)) != 17:
                 return False
-            import win32com.client  # type: ignore
 
-            before = self._bounds_signature(layer)
-            doc.ActiveLayer = layer
-            action_id = self.app.StringIDToTypeID("placedLayerReplaceContents")
-            descriptor = win32com.client.Dispatch("Photoshop.ActionDescriptor")
-            descriptor.PutPath(self.app.CharIDToTypeID("null"), str(Path(image_path).resolve()))
-            self.app.ExecuteAction(action_id, descriptor, 2)
-            after = self._bounds_signature(layer)
-            if before is not None and after is not None and before != after:
-                logger.warning(
-                    "Smart object '%s' changed bounds after replacement; "
-                    "the original proportional transform was not preserved.",
-                    getattr(layer, "Name", ""),
-                )
+            before = original_bounds or self._bounds_signature(layer)
+            path_literal = str(Path(image_path).resolve()).replace("\\", "\\\\").replace('"', '\\"')
+            layer_id = int(getattr(layer, "ID"))
+            script = (
+                'function findLayer(container, targetId) {'
+                '  for (var i = 0; i < container.layers.length; i++) {'
+                '    var candidate = container.layers[i];'
+                '    if (candidate.id == targetId) return candidate;'
+                '    if (candidate.typename == "LayerSet") {'
+                '      var nested = findLayer(candidate, targetId);'
+                '      if (nested) return nested;'
+                '    }'
+                '  }'
+                '  return null;'
+                '}'
+                'var targetLayer = findLayer(app.activeDocument, ' + str(layer_id) + ');'
+                'if (!targetLayer) throw new Error("Layer not found: ' + str(layer_id) + '");'
+                'app.activeDocument.activeLayer = targetLayer;'
+                'var descriptor = new ActionDescriptor();'
+                'descriptor.putPath(charIDToTypeID("null"), new File("' + path_literal + '"));'
+                'executeAction(stringIDToTypeID("placedLayerReplaceContents"), descriptor, DialogModes.NO);'
+            )
+            self.app.DoJavaScript(script)
+            layer.Visible = False
+            layer.Visible = True
+            self._wait_for_update()
+            if before is not None:
+                self._fit_layer_to_bounds(layer, before)
+                logger.info("Fitted Smart Object '%s' inside its original slot bounds.", getattr(layer, "Name", ""))
             logger.info("Replaced smart object '%s' with %s", getattr(layer, "Name", ""), image_path)
             return True
         except Exception as exc:  # pragma: no cover - COM fallback
@@ -308,10 +376,13 @@ class PhotoshopEngine:
                 for i in range(group.LayerSets.Count):
                     layer_set = group.LayerSets[i]
                     if "IMAGEM" in getattr(layer_set, "Name", "").upper():
-                        if hasattr(layer_set, "ArtLayers"):
-                            for j in range(layer_set.ArtLayers.Count):
-                                layer = layer_set.ArtLayers[j]
-                                self._replace_smart_object_layer(doc, layer, image_path)
+                        image_layers = [
+                            (layer, self._bounds_signature(layer))
+                            for layer in self._iter_layers(layer_set)
+                            if int(getattr(layer, "Kind", 0)) == 17
+                        ]
+                        for layer, original_bounds in image_layers:
+                            self._replace_smart_object_layer(doc, layer, image_path, original_bounds)
                         break
 
             price_group = None
@@ -351,6 +422,7 @@ class PhotoshopEngine:
                     elif upper == ",":
                         self._apply_text_value(layer, ",")
 
+            self._wait_for_update(0.5)
             logger.info("Applied offer %s into PSD slot %s", getattr(offer, 'nome', ''), target_slot)
             return True
         except Exception as exc:  # pragma: no cover - COM fallback
@@ -372,6 +444,7 @@ class PhotoshopEngine:
         if self.app is not None:
             for attempt in range(3):
                 try:
+                    self._wait_for_update(0.5)
                     doc = self.app.ActiveDocument
                     if doc is not None:
                         jpg_options = self._make_save_options("JPG")
@@ -410,6 +483,7 @@ class PhotoshopEngine:
         if self.app is not None:
             for attempt in range(3):
                 try:
+                    self._wait_for_update(0.5)
                     doc = self.app.ActiveDocument
                     if doc is not None:
                         png_options = self._make_save_options("PNG")
