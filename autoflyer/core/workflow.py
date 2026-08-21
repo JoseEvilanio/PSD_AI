@@ -89,8 +89,19 @@ class GenerationWorkflow:
         engine = PhotoshopEngine(visible=True, display_dialogs=False)
         engine.open_template(template_path)
 
+        update_warnings: List[str] = []
         for item in items:
-            engine.update_offer_slot(item, slot_number=item.slot)
+            updated = False
+            for attempt in range(8):
+                if engine.update_offer_slot(item, slot_number=item.slot):
+                    updated = True
+                    break
+                if engine.app is not None:
+                    engine._wait_for_update(min(3.0 + attempt * 1.5, 12.0))
+            if not updated:
+                warning = f"Não foi possível atualizar o slot {item.slot} no PSD."
+                update_warnings.append(warning)
+                logger.warning(warning)
 
         output_ext = "png" if self.export_format == "PNG" else "jpg"
         output = self.outputs_dir / f"{template_path.stem}_gerado.{output_ext}"
@@ -105,6 +116,6 @@ class GenerationWorkflow:
             items_loaded=len(items),
             validation_ok=True,
             output_path=output,
-            warnings=validation.warnings + [f"PSD template recognized with {len(slot_layout)} product slots; {len(items)} offers mapped; export format: {self.export_format}."],
+            warnings=validation.warnings + update_warnings + [f"PSD template recognized with {len(slot_layout)} product slots; {len(items)} offers mapped; export format: {self.export_format}."],
             errors=validation.errors,
         )

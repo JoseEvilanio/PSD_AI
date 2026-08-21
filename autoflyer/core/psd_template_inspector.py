@@ -14,16 +14,31 @@ class PsdTemplateInspector:
     """Inspects the final PSD template and extracts a slot map for each product card."""
 
     PRICE_TOKENS = {"KG", "UN", "LT", "CX", "PCT", "G", "ML"}
-    NON_NAME_TOKENS = {"POR", "R$", "DE;", "DE", "CADA", "KG", "UN", "LT", "CX", "PCT", "G", "ML", ","}
+    NON_NAME_TOKENS = {"POR", "R$", "DE;", "DE", "BD", "CADA", "KG", "UN", "LT", "CX", "PCT", "G", "ML", ","}
+
+    @staticmethod
+    def _children(node: Any) -> List[Any]:
+        try:
+            return list(node)
+        except TypeError:
+            return []
 
     @staticmethod
     def _iter_descendants(node: Any) -> Iterable[Any]:
-        for child in list(node):
+        for child in PsdTemplateInspector._children(node):
             yield child
-            try:
-                yield from PsdTemplateInspector._iter_descendants(child)
-            except TypeError:
-                pass
+            yield from PsdTemplateInspector._iter_descendants(child)
+
+    @classmethod
+    def _is_slot_group_name(cls, name: Any) -> bool:
+        normalized = str(name or '').strip().upper()
+        return bool(
+            re.search(r'^(?:GRUPO|GROUP|PRODUCT|PRODUTO)\s*[_-]?\s*\d+$', normalized)
+            or ('DESCRI' in normalized and 'PRE' in normalized)
+            or 'PREÇO' in normalized
+            or 'PRECO' in normalized
+        )
+
 
     @staticmethod
     def _extract_text(layer: Any) -> str:
@@ -122,16 +137,23 @@ class PsdTemplateInspector:
                     break
 
         nome = None
-        for child in list(group):
+        for child in cls._children(group):
             direct_text = cls._extract_text(child)
             if not direct_text:
                 continue
             upper_text = direct_text.upper()
-            if 'IMAGEM' in upper_text or 'PREÇO' in upper_text or 'PRECO' in upper_text:
+            if (
+                'IMAGEM' in upper_text
+                or 'PREÇO' in upper_text
+                or 'PRECO' in upper_text
+                or upper_text.startswith('SHAPE')
+                or upper_text.startswith('ELLIPSE')
+                or upper_text.startswith('RECTANGLE')
+            ):
                 continue
-            if upper_text in {'POR', 'R$', 'CADA', 'KG', 'UN', 'LT', 'CX', 'PCT', 'G', 'ML', ',', 'DE'}:
+            if upper_text in {'POR', 'R$', 'CADA', 'KG', 'UN', 'LT', 'CX', 'PCT', 'G', 'ML', ',', 'DE', 'BD'}:
                 continue
-            if re.fullmatch(r'(?:DE;?\s*\d+[.,]\d+|R\$\s*\d+[.,]\d+|\d+[.,]\d+|\d+)', direct_text):
+            if re.fullmatch(r'(?:DE;?\s*\d+[.,]\d+|R\$\s*\d+[.,]\d+|(?:\d+[.,])?\d+|[,\.]\d+)', direct_text):
                 continue
             nome = direct_text
             break
@@ -140,11 +162,18 @@ class PsdTemplateInspector:
             for entry in text_entries:
                 text = entry['text']
                 upper = text.upper()
-                if 'IMAGEM' in upper or 'PREÇO' in upper or 'PRECO' in upper:
+                if (
+                    'IMAGEM' in upper
+                    or 'PREÇO' in upper
+                    or 'PRECO' in upper
+                    or upper.startswith('SHAPE')
+                    or upper.startswith('ELLIPSE')
+                    or upper.startswith('RECTANGLE')
+                ):
                     continue
-                if upper in {'POR', 'R$', 'CADA', 'KG', 'UN', 'LT', 'CX', 'PCT', 'G', 'ML', ',', 'DE'}:
+                if upper in {'POR', 'R$', 'CADA', 'KG', 'UN', 'LT', 'CX', 'PCT', 'G', 'ML', ',', 'DE', 'BD'}:
                     continue
-                if re.fullmatch(r'(?:DE;?\s*\d+[.,]\d+|R\$\s*\d+[.,]\d+|\d+[.,]\d+|\d+)', text):
+                if re.fullmatch(r'(?:DE;?\s*\d+[.,]\d+|R\$\s*\d+[.,]\d+|(?:\d+[.,])?\d+|[,\.]\d+)', text):
                     continue
                 nome = text
                 break
@@ -158,7 +187,7 @@ class PsdTemplateInspector:
 
         preco_por = None
         price_group = None
-        for child in list(group):
+        for child in cls._children(group):
             name = str(getattr(child, 'name', '') or '').strip().upper()
             if 'PREÇO' in name or 'PRECO' in name:
                 price_group = child
@@ -210,7 +239,7 @@ class PsdTemplateInspector:
             normalized = str(name).strip()
             if not normalized:
                 continue
-            if 'DESCRI' not in normalized.upper() and 'IMAGEM' not in normalized.upper() and 'PRE' not in normalized.upper():
+            if not cls._is_slot_group_name(normalized):
                 continue
 
             slot_map = cls._extract_slot_metadata(group)

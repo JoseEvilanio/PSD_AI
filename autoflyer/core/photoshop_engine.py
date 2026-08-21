@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -178,6 +179,7 @@ class PhotoshopEngine:
         if doc is None:
             return None
         target_token = str(slot_number).zfill(2)
+        fallback = None
         for layer in self._iter_layers(doc):
             name = getattr(layer, "Name", "") or ""
             if not name:
@@ -185,7 +187,180 @@ class PhotoshopEngine:
             upper = name.upper()
             if "DESCRI" in upper and "PRE" in upper and (f"{slot_number}" in name or target_token in name):
                 return layer
-        return None
+            if (
+                fallback is None
+                and (
+                    "PRODUCT" in upper
+                    or "PRODUTO" in upper
+                    or re.search(r"^(?:GRUPO|GROUP)\s*[_-]?\s*\d+$", upper)
+                )
+                and (f"{slot_number}" in name or target_token in name)
+            ):
+                fallback = layer
+        return fallback
+
+    @classmethod
+    def _text_content(cls, layer: Any) -> str:
+        try:
+            contents = getattr(getattr(layer, "TextItem", None), "Contents", None)
+            if contents is not None:
+                return str(contents).strip()
+        except Exception:
+            pass
+        return str(getattr(layer, "Name", "") or "").strip()
+
+    @classmethod
+    def _text_layers(cls, node: Any) -> list[Any]:
+        return [layer for layer in cls._iter_layers(node) if cls._is_text_layer(layer)]
+
+    @classmethod
+    def _smart_object_layers(cls, node: Any) -> list[Any]:
+        return [
+            layer for layer in cls._iter_layers(node)
+            if int(getattr(layer, "Kind", 0)) == 17
+        ]
+
+    @classmethod
+    def _largest_smart_object(cls, node: Any) -> Any:
+        layers = cls._smart_object_layers(node)
+        measured = []
+        for layer in layers:
+            bounds = cls._bounds_signature(layer)
+            if bounds is None:
+                continue
+            width = max(bounds[2] - bounds[0], 0.0)
+            height = max(bounds[3] - bounds[1], 0.0)
+            measured.append((width * height, layer, bounds))
+        if not measured:
+            return None
+        return max(measured, key=lambda item: item[0])
+
+    @classmethod
+    def _smart_objects_with_bounds(cls, node: Any) -> list[tuple[Any, tuple[float, float, float, float]]]:
+        result = []
+        for layer in cls._smart_object_layers(node):
+            bounds = cls._bounds_signature(layer)
+            if bounds is not None:
+                result.append((layer, bounds))
+        return result
+
+    @staticmethod
+    def _is_shape_name(name: Any) -> bool:
+        normalized = unicodedata.normalize("NFKD", str(name or "")).upper()
+        normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+        return any(token in normalized for token in ("SHAPE", "RECTANGLE", "RETANGULO", "ELLIPSE", "ELIPSE"))
+
+    @classmethod
+    def _shape_references(cls, node: Any) -> list[tuple[float, float, float, float]]:
+        references = []
+        for layer in cls._iter_layers(node):
+            if cls._is_text_layer(layer) or int(getattr(layer, "Kind", 0)) == 17:
+                continue
+            if not cls._is_shape_name(getattr(layer, "Name", "")):
+                continue
+            bounds = cls._bounds_signature(layer)
+            if bounds is None:
+                continue
+            if bounds[2] - bounds[0] >= 10 and bounds[3] - bounds[1] >= 10:
+                references.append(bounds)
+        return references
+
+    @classmethod
+    def _match_shape_to_image(
+        cls,
+        image_bounds: tuple[float, float, float, float],
+        shapes: list[tuple[float, float, float, float]],
+        used: set[int],
+    ) -> Optional[tuple[float, float, float, float]]:
+        center_x = (image_bounds[0] + image_bounds[2]) / 2.0
+        center_y = (image_bounds[1] + image_bounds[3]) / 2.0
+        candidates = []
+        for index, shape in enumerate(shapes):
+            if index in used:
+                continue
+            shape_center_x = (shape[0] + shape[2]) / 2.0
+            shape_center_y = (shape[1] + shape[3]) / 2.0
+            contains_center = shape[0] <= center_x <= shape[2] and shape[1] <= center_y <= shape[3]
+            if not contains_center:
+                continue
+            distance = (shape_center_x - center_x) ** 2 + (shape_center_y - center_y) ** 2
+            candidates.append((distance, index, shape))
+        if not candidates:
+            return None
+        _, index, shape = min(candidates, key=lambda item: item[0])
+        used.add(index)
+        return shape
+
+    @classmethod
+    def _shape_reference_bounds(
+        cls,
+        node: Any,
+        image_bounds: Optional[tuple[float, float, float, float]] = None,
+    ) -> Optional[tuple[float, float, float, float]]:
+        candidates = []
+        image_center = None
+        if image_bounds is not None:
+            image_center = (
+                (image_bounds[0] + image_bounds[2]) / 2.0,
+                (image_bounds[1] + image_bounds[3]) / 2.0,
+            )
+        for layer in cls._iter_layers(node):
+            if cls._is_text_layer(layer) or int(getattr(layer, "Kind", 0)) == 17:
+                continue
+            if not cls._is_shape_name(getattr(layer, "Name", "")):
+                continue
+            bounds = cls._bounds_signature(layer)
+            if bounds is None:
+                continue
+            width = max(bounds[2] - bounds[0], 0.0)
+            height = max(bounds[3] - bounds[1], 0.0)
+            if width < 10 or height < 10:
+                continue
+            center = ((bounds[0] + bounds[2]) / 2.0, (bounds[1] + bounds[3]) / 2.0)
+            distance = 0.0 if image_center is None else (
+                (center[0] - image_center[0]) ** 2 + (center[1] - image_center[1]) ** 2
+            )
+            candidates.append((distance, width * height, bounds))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: (item[0], -item[1]))[2]
+
+    @classmethod
+    def _find_description_layer(cls, group: Any) -> Any:
+        excluded = {"DE", "POR", "R$", "UN", "KG", "LT", "CX", "PCT", "G", "ML", "CADA", ","}
+        candidates = []
+        for layer in cls._text_layers(group):
+            text = cls._text_content(layer)
+            upper = text.upper().replace(";", "").strip()
+            if not text or upper in excluded:
+                continue
+            if re.fullmatch(r"[\d,.]+", text) or re.match(r"^(?:DE|BD)\b", upper):
+                continue
+            if (
+                ("PRE" in upper and len(text) < 12)
+                or upper.startswith("SHAPE")
+                or upper.startswith("ELLIPSE")
+                or upper.startswith("RECTANGLE")
+                or upper.startswith("RETANGULO")
+                or upper.startswith("ELIPSE")
+            ):
+                continue
+            candidates.append((len(text), layer))
+        return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+    @staticmethod
+    def _is_unit_text(text: str) -> bool:
+        return text.upper().strip() in {"UN", "KG", "LT", "CX", "PCT", "G", "ML"}
+
+    @staticmethod
+    def _is_unit_layer(name: str, text: str = "") -> bool:
+        normalized_name = str(name or "").upper().strip()
+        normalized_text = str(text or "").upper().strip()
+        return (
+            PhotoshopEngine._is_unit_text(normalized_text)
+            or normalized_name in {"UN", "KG", "LT", "CX", "PCT", "G", "ML"}
+            or any(token in normalized_name for token in ("UNIDADE", "UNID", "MEDIDA", "UNIT"))
+        )
 
     @staticmethod
     def _is_text_layer(layer: Any) -> bool:
@@ -195,13 +370,24 @@ class PhotoshopEngine:
         except Exception:
             return False
 
-    def _apply_text_value(self, layer: Any, value: str) -> None:
+    def _apply_text_value(self, layer: Any, value: str) -> bool:
         if layer is None or not self._is_text_layer(layer):
-            return
+            return False
         try:
-            layer.TextItem.Contents = str(value)
+            expected = str(value)
+            layer.TextItem.Contents = expected
+            actual = str(layer.TextItem.Contents)
+            if actual != expected:
+                logger.warning(
+                    "Photoshop did not confirm text change on layer '%s' (expected '%s', got '%s')",
+                    getattr(layer, "Name", ""), expected, actual,
+                )
+                return False
+            logger.info("Updated Photoshop text layer '%s' to '%s'", getattr(layer, "Name", ""), expected)
+            return True
         except Exception as exc:  # pragma: no cover - COM fallback
             logger.warning("Failed to set text on layer '%s': %s", getattr(layer, "Name", ""), exc)
+            return False
 
     @staticmethod
     def _make_save_options(format_name: str) -> Any:
@@ -230,18 +416,11 @@ class PhotoshopEngine:
     def _wait_for_update(self, delay: float = 1.0) -> None:
         """Allow Photoshop to finish asynchronous layer updates before continuing."""
         time.sleep(delay)
-        if self.app is None:
-            return
-        try:
-            self.app.DoJavaScript("app.refresh();")
-            time.sleep(0.25)
-        except Exception:
-            logger.debug("Photoshop refresh is unavailable; continuing after delay.", exc_info=True)
 
     def _fit_layer_to_bounds(self, layer: Any, target: tuple[float, float, float, float]) -> None:
         target_left, target_top, target_right, target_bottom = target
-        target_width = max(target_right - target_left, 1.0)
-        target_height = max(target_bottom - target_top, 1.0)
+        target_width = max(target_right - target_left, 1.0) * 0.90
+        target_height = max(target_bottom - target_top, 1.0) * 0.90
         target_center_x = (target_left + target_right) / 2.0
         target_center_y = (target_top + target_bottom) / 2.0
 
@@ -273,6 +452,109 @@ class PhotoshopEngine:
             "new UnitValue(" + str(target_center_y) + " - centerY, 'px'));"
         )
         self.app.DoJavaScript(script)
+
+    def _fit_text_to_bounds(
+        self,
+        layer: Any,
+        target: tuple[float, float, float, float],
+        anchor: Optional[tuple[float, float, float, float]] = None,
+        horizontal_center: Optional[float] = None,
+    ) -> None:
+        """Wrap replacement text while preserving its original font size and slot."""
+        target_left, target_top, target_right, target_bottom = target
+        target_width = max(target_right - target_left, 1.0) * 0.96
+        anchor_bounds = anchor or target
+        target_center_x = horizontal_center if horizontal_center is not None else (anchor_bounds[0] + anchor_bounds[2]) / 2.0
+        target_center_y = (anchor_bounds[1] + anchor_bounds[3]) / 2.0
+        layer_id = int(getattr(layer, "ID"))
+        script = (
+            "function findLayer(container, targetId) {"
+            "  for (var i = 0; i < container.layers.length; i++) {"
+            "    var candidate = container.layers[i];"
+            "    if (candidate.id == targetId) return candidate;"
+            "    if (candidate.typename == 'LayerSet') {"
+            "      var nested = findLayer(candidate, targetId);"
+            "      if (nested) return nested;"
+            "    }"
+            "  }"
+            "  return null;"
+            "}"
+            "function px(value) { return value.as('px'); }"
+            "var fittedLayer = findLayer(app.activeDocument, " + str(layer_id) + ");"
+            "if (!fittedLayer) throw new Error('Text layer not found for fitting');"
+            "var textItem = fittedLayer.textItem;"
+            "var words = textItem.contents.replace(/\\r?\\n/g, ' ').split(/\\s+/);"
+            "var lines = [];"
+            "var current = '';"
+            "for (var i = 0; i < words.length; i++) {"
+            "  if (!words[i]) continue;"
+            "  var candidate = current ? current + ' ' + words[i] : words[i];"
+            "  textItem.contents = candidate;"
+            "  var measured = fittedLayer.bounds;"
+            "  var measuredWidth = Math.max(px(measured[2]) - px(measured[0]), 1);"
+            "  if (current && measuredWidth > " + str(target_width) + ") {"
+            "    lines.push(current);"
+            "    current = words[i];"
+            "  } else {"
+            "    current = candidate;"
+            "  }"
+            "}"
+            "if (current) lines.push(current);"
+            "textItem.contents = lines.join('\\r');"
+            "var bounds = fittedLayer.bounds;"
+            "var currentCenterX = (px(bounds[0]) + px(bounds[2])) / 2;"
+            "fittedLayer.translate(new UnitValue(" + str(target_center_x) + " - currentCenterX, 'px'), new UnitValue(0, 'px'));"
+        )
+        self.app.DoJavaScript(script)
+
+    @staticmethod
+    def _image_target_bounds(
+        shape: tuple[float, float, float, float],
+        description_bounds: Optional[tuple[float, float, float, float]],
+    ) -> tuple[float, float, float, float]:
+        left, top, right, bottom = shape
+        margin_x = max((right - left) * 0.08, 4.0)
+        margin_y = max((bottom - top) * 0.08, 4.0)
+        top += margin_y
+        bottom -= margin_y
+        if description_bounds is not None:
+            # Keep a visible gap between the description and the image area.
+            top = max(top, description_bounds[3] + max((bottom - top) * 0.10, 12.0))
+        if bottom <= top:
+            top, bottom = shape[1] + margin_y, shape[3] - margin_y
+        return left + margin_x, top, right - margin_x, bottom
+
+    @staticmethod
+    def _preserve_image_position(
+        image_bounds: tuple[float, float, float, float],
+        shape_bounds: Optional[tuple[float, float, float, float]],
+    ) -> tuple[float, float, float, float]:
+        """Keep the Smart Object position; use the shape only as a size limit."""
+        if shape_bounds is None:
+            return image_bounds
+        image_width = max(image_bounds[2] - image_bounds[0], 1.0)
+        image_height = max(image_bounds[3] - image_bounds[1], 1.0)
+        shape_width = max(shape_bounds[2] - shape_bounds[0], 1.0)
+        shape_height = max(shape_bounds[3] - shape_bounds[1], 1.0)
+        scale = min(1.0, shape_width / image_width, shape_height / image_height)
+        center_x = (image_bounds[0] + image_bounds[2]) / 2.0
+        center_y = (image_bounds[1] + image_bounds[3]) / 2.0
+        width = image_width * scale
+        height = image_height * scale
+        return (
+            center_x - width / 2.0,
+            center_y - height / 2.0,
+            center_x + width / 2.0,
+            center_y + height / 2.0,
+        )
+
+    @staticmethod
+    def _valid_bounds(bounds: Optional[tuple[float, float, float, float]]) -> bool:
+        return bool(
+            bounds is not None
+            and bounds[2] > bounds[0] + 2
+            and bounds[3] > bounds[1] + 2
+        )
 
     def replace_smart_object(self, layer_name: str, image_path: str | Path) -> bool:
         if self.app is None:
@@ -326,7 +608,6 @@ class PhotoshopEngine:
                 'executeAction(stringIDToTypeID("placedLayerReplaceContents"), descriptor, DialogModes.NO);'
             )
             self.app.DoJavaScript(script)
-            layer.Visible = False
             layer.Visible = True
             self._wait_for_update()
             if before is not None:
@@ -360,30 +641,54 @@ class PhotoshopEngine:
                 return False
 
             product_name = getattr(offer, "nome", "") or ""
-            if product_name and hasattr(group, "ArtLayers"):
-                for i in range(group.ArtLayers.Count):
-                    layer = group.ArtLayers[i]
-                    name = getattr(layer, "Name", "") or ""
-                    upper = name.upper()
-                    if "IMAGEM" in upper or "PRE" in upper or "FORMA" in upper or re.fullmatch(r"[\d,.;\-]+", name.strip()):
-                        continue
-                    if self._is_text_layer(layer):
-                        self._apply_text_value(layer, product_name)
-                        break
+            changed = False
+            shape_references = self._shape_references(group)
+            description_bounds = None
+            if product_name:
+                description_layer = self._find_description_layer(group)
+                if description_layer is not None:
+                    description_bounds = self._bounds_signature(description_layer)
+                    changed = self._apply_text_value(description_layer, product_name) or changed
+                    if description_bounds is not None and shape_references:
+                        try:
+                            description_shape = min(
+                                shape_references,
+                                key=lambda shape: (
+                                    ((shape[0] + shape[2]) / 2.0 - (description_bounds[0] + description_bounds[2]) / 2.0) ** 2
+                                    + ((shape[1] + shape[3]) / 2.0 - (description_bounds[1] + description_bounds[3]) / 2.0) ** 2
+                                ),
+                            )
+                            description_shape_center_x = (description_shape[0] + description_shape[2]) / 2.0
+                            self._fit_text_to_bounds(
+                                description_layer,
+                                description_shape,
+                                description_bounds,
+                                horizontal_center=description_shape_center_x,
+                            )
+                            description_bounds = self._bounds_signature(description_layer) or description_bounds
+                        except Exception as exc:
+                            logger.warning("Could not fit description layer '%s': %s", getattr(description_layer, "Name", ""), exc)
+                else:
+                    logger.warning("No description text layer found in slot %s", target_slot)
 
             image_path = getattr(offer, "imagem", None)
-            if image_path and hasattr(group, "LayerSets"):
-                for i in range(group.LayerSets.Count):
-                    layer_set = group.LayerSets[i]
-                    if "IMAGEM" in getattr(layer_set, "Name", "").upper():
-                        image_layers = [
-                            (layer, self._bounds_signature(layer))
-                            for layer in self._iter_layers(layer_set)
-                            if int(getattr(layer, "Kind", 0)) == 17
-                        ]
-                        for layer, original_bounds in image_layers:
-                            self._replace_smart_object_layer(doc, layer, image_path, original_bounds)
-                        break
+            if image_path:
+                image_layers = self._smart_objects_with_bounds(group)
+                if image_layers:
+                    used_shapes: set[int] = set()
+                    for layer, image_bounds in image_layers:
+                        reference_bounds = self._match_shape_to_image(image_bounds, shape_references, used_shapes)
+                        target_bounds = self._preserve_image_position(image_bounds, reference_bounds)
+                        if not self._valid_bounds(target_bounds):
+                            target_bounds = image_bounds
+                        logger.info("Using image target bounds for slot %s: %s", target_slot, target_bounds)
+                        image_replaced = self._replace_smart_object_layer(doc, layer, image_path, target_bounds)
+                        if image_replaced:
+                            changed = True
+                        else:
+                            logger.warning("Could not replace image Smart Object '%s' in slot %s", getattr(layer, "Name", ""), target_slot)
+                else:
+                    logger.warning("No measurable image Smart Object found in slot %s", target_slot)
 
             price_group = None
             if hasattr(group, "LayerSets"):
@@ -391,38 +696,71 @@ class PhotoshopEngine:
                     layer_set = group.LayerSets[i]
                     name = getattr(layer_set, "Name", "") or ""
                     upper = name.upper()
-                    if "PRE" in upper:
+                    if any(token in upper for token in ("PRE", "PRICE", "PREÇO", "PRECO")):
                         price_group = layer_set
                         break
             if price_group is not None and hasattr(price_group, "ArtLayers"):
                 price_layers = [price_group.ArtLayers[i] for i in range(price_group.ArtLayers.Count)]
                 numeric_layers = [
                     layer for layer in price_layers
-                    if self._is_text_layer(layer) and re.fullmatch(r"\d+", getattr(layer, "Name", "").strip())
+                    if self._is_text_layer(layer) and re.fullmatch(r"\d+", self._text_content(layer))
                 ]
                 price_value = float(getattr(offer, "preco_por", 0) or 0)
                 inteiro = int(price_value)
                 cents = int(round((price_value - inteiro) * 100))
                 if len(numeric_layers) >= 2:
-                    self._apply_text_value(numeric_layers[-2], str(cents).zfill(2))
-                    self._apply_text_value(numeric_layers[-1], str(inteiro))
+                    changed = self._apply_text_value(numeric_layers[-2], str(cents).zfill(2)) or changed
+                    changed = self._apply_text_value(numeric_layers[-1], str(inteiro)) or changed
 
                 for layer in price_layers:
                     if not self._is_text_layer(layer):
                         continue
                     name = getattr(layer, "Name", "") or ""
                     upper = name.upper().strip()
-                    if re.match(r"^DE", upper):
-                        self._apply_text_value(layer, f"DE;{float(getattr(offer, 'preco_de', 0) or 0):.2f}".replace('.', ','))
+                    current = self._text_content(layer).upper().strip()
+                    if self._is_unit_layer(upper, current):
+                        unit = getattr(offer, "unidade", None) or current or upper
+                        changed = self._apply_text_value(layer, str(unit).upper()) or changed
+                    elif re.match(r"^DE", current):
+                        changed = self._apply_text_value(layer, f"DE;{float(getattr(offer, 'preco_de', 0) or 0):.2f}".replace('.', ',')) or changed
                     elif upper in {"POR", "R$"}:
-                        self._apply_text_value(layer, upper)
-                    elif upper in {"KG", "UN", "LT", "CX", "PCT", "G", "ML"}:
-                        unit = getattr(offer, "unidade", None) or upper
-                        self._apply_text_value(layer, str(unit).upper())
+                        changed = self._apply_text_value(layer, upper) or changed
                     elif upper == ",":
-                        self._apply_text_value(layer, ",")
+                        changed = self._apply_text_value(layer, ",") or changed
+
+            if price_group is None:
+                price_layers = self._text_layers(group)
+                price_value = float(getattr(offer, "preco_por", 0) or 0)
+                inteiro = int(price_value)
+                cents = int(round((price_value - inteiro) * 100))
+                integer_layers = [
+                    layer for layer in price_layers
+                    if re.fullmatch(r"\d+", self._text_content(layer))
+                ]
+                decimal_layers = [
+                    layer for layer in price_layers
+                    if re.fullmatch(r"[,\.]\d{2}", self._text_content(layer))
+                ]
+                if decimal_layers:
+                    changed = self._apply_text_value(decimal_layers[0], f",{cents:02d}") or changed
+                if integer_layers:
+                    changed = self._apply_text_value(integer_layers[-1], str(inteiro)) or changed
+
+                for layer in price_layers:
+                    text = self._text_content(layer).upper().strip()
+                    if self._is_unit_layer(getattr(layer, "Name", ""), text):
+                        unit = getattr(offer, "unidade", None)
+                        if unit:
+                            changed = self._apply_text_value(layer, str(unit).upper()) or changed
+                    elif re.match(r"^(?:DE|BD)\b", text):
+                        value = getattr(offer, "preco_de", None)
+                        if value is not None:
+                            changed = self._apply_text_value(layer, f"DE;{float(value):.2f}".replace(".", ",")) or changed
 
             self._wait_for_update(0.5)
+            if not changed:
+                logger.warning("No editable text layer was changed for offer %s in PSD slot %s", getattr(offer, 'nome', ''), target_slot)
+                return False
             logger.info("Applied offer %s into PSD slot %s", getattr(offer, 'nome', ''), target_slot)
             return True
         except Exception as exc:  # pragma: no cover - COM fallback
