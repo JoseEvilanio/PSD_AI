@@ -1,0 +1,14 @@
+paths:
+  templates_dir: arquivo.psd
+  products_dir: data/products
+  inputs_dir: data/inputs
+  outputs_dir: data/outputs
+  logs_dir: logs
+
+photoshop:
+  visible: true
+  display_dialogs: false
+
+export:
+  format: JPG
+  quality: 90
