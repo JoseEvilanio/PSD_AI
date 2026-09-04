@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import re
 import unicodedata
 import zlib
@@ -84,16 +85,65 @@ class OfferItem:
         }
 
 
-class DataLoader:
-    COLUMN_SYNONYMS = {
-        "slot": ["slot", "posicao", "item", "ordem"],
-        "nome": ["nome", "produto", "descricao", "titulo"],
+def mapear_colunas_com_prioridade(colunas_planilha: list | Any) -> dict[str, str]:
+    """
+    Mapeia as colunas da planilha para as chaves internas do Autoflyer,
+    garantindo que nomes comerciais completos tenham prioridade absoluta
+    sobre descrições abreviadas de ERP/PDV.
+    """
+    def _norm(c: Any) -> str:
+        s = str(c).strip().lower().replace(" ", "_").replace("-", "_")
+        normalized = unicodedata.normalize("NFKD", s)
+        return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
+    colunas_raw = list(colunas_planilha)
+    colunas_lower = [str(col).lower() for col in colunas_raw]
+    colunas_norm = [_norm(col) for col in colunas_raw]
+    mapeamento_final: dict[str, str] = {}
+
+    # LISTA DE PRIORIDADE: O sistema tentará encontrar na ordem exata definida abaixo
+    regras_prioridade = {
+        "nome": ["nome", "produto", "titulo", "descricao"],  # 'nome' e 'produto' vêm ANTES de 'descricao'
         "preco_de": ["preco_de", "preco_original", "de", "precode"],
         "preco_por": ["preco_por", "por", "preco_promocional", "preco"],
         "imagem": ["imagem", "img", "foto", "image"],
         "unidade": ["unidade", "un", "medida"],
+        "slot": ["slot", "posicao", "item", "ordem"],
         "cada": ["cada"],
     }
+
+    for chave_interna, sinonimos in regras_prioridade.items():
+        # Busca sequencial do melhor candidato
+        for sinonimo in sinonimos:
+            if sinonimo in colunas_lower:
+                # Recupera o nome exato original da coluna da planilha (preservando maiúsculas/minúsculas)
+                indice = colunas_lower.index(sinonimo)
+                mapeamento_final[chave_interna] = colunas_raw[indice]
+                # IMPORTANTÍSSIMO: Paramos a busca neste sinonimo.
+                # Se achamos 'produto', ignoramos 'descricao' para evitar abreviações!
+                break
+            if sinonimo in colunas_norm:
+                indice = colunas_norm.index(sinonimo)
+                mapeamento_final[chave_interna] = colunas_raw[indice]
+                break
+
+    return mapeamento_final
+
+
+class DataLoader:
+    COLUMN_SYNONYMS = {
+        "nome": ["nome", "produto", "titulo", "descricao"],
+        "preco_de": ["preco_de", "preco_original", "de", "precode"],
+        "preco_por": ["preco_por", "por", "preco_promocional", "preco"],
+        "imagem": ["imagem", "img", "foto", "image"],
+        "unidade": ["unidade", "un", "medida"],
+        "slot": ["slot", "posicao", "item", "ordem"],
+        "cada": ["cada"],
+    }
+
+    @staticmethod
+    def mapear_colunas_com_prioridade(colunas_planilha: list | Any) -> dict[str, str]:
+        return mapear_colunas_com_prioridade(colunas_planilha)
 
     def __init__(self, products_dir: Optional[str | Path] = None, image_search_dir: Optional[str | Path] = None):
         self.products_dir = Path(products_dir).resolve() if products_dir else None
@@ -236,7 +286,21 @@ class DataLoader:
                     if exact_stem:
                         return str(file)
                     if overlap:
-                        ranked.append((len(overlap), len(filename_words & product_words), file))
+                        # Previne falso positivo se houver colisão de termos parecidos (ex: moca vs mococa)
+                        has_brand_conflict = False
+                        for wp in product_words:
+                            if wp in filename_words:
+                                continue
+                            for wf in filename_words:
+                                if wf in product_words:
+                                    continue
+                                if 0.70 <= difflib.SequenceMatcher(None, wp, wf).ratio() < 1.0:
+                                    has_brand_conflict = True
+                                    break
+                            if has_brand_conflict:
+                                break
+                        if not has_brand_conflict:
+                            ranked.append((len(overlap), len(filename_words & product_words), file))
 
             if ranked:
                 ranked.sort(key=lambda item: (item[0], item[1], -len(str(item[2]))), reverse=True)
@@ -269,12 +333,9 @@ class DataLoader:
     def _parse_dataframe(self, df: pd.DataFrame, context_dir: Optional[Path] = None) -> Tuple[List[OfferItem], Dict[str, Any]]:
         df = df.dropna(how="all").copy()
 
-        column_map = {}
-        for col in df.columns:
-            mapped = self._match_column(str(col))
-            if mapped:
-                column_map[col] = mapped
-        renamed = df.rename(columns=column_map)
+        mapeamento = self.mapear_colunas_com_prioridade(list(df.columns))
+        col_to_internal = {col_orig: chave for chave, col_orig in mapeamento.items()}
+        renamed = df.rename(columns=col_to_internal)
 
         items: List[OfferItem] = []
         for idx, row in renamed.iterrows():

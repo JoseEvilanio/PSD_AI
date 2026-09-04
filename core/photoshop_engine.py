@@ -117,7 +117,36 @@ def calculate_safe_text_box(
         safe.top = mid - min_h / 2.0
         safe.bottom = mid + min_h / 2.0
 
-    return safe
+def quebrar_texto_por_comprimento(texto: str, max_caracteres: int) -> list:
+    """
+    Divide um texto em várias linhas sem quebrar palavras ao meio,
+    respeitando o limite máximo de caracteres por linha.
+    """
+    palavras = texto.split()
+    if not palavras:
+        return []
+
+    linhas = []
+    linha_atual = []
+    comprimento_atual = 0
+
+    for palavra in palavras:
+        tamanho_palavra = len(palavra)
+        if not linha_atual:
+            linha_atual.append(palavra)
+            comprimento_atual = tamanho_palavra
+        elif comprimento_atual + 1 + tamanho_palavra <= max_caracteres:
+            linha_atual.append(palavra)
+            comprimento_atual += 1 + tamanho_palavra
+        else:
+            linhas.append(" ".join(linha_atual))
+            linha_atual = [palavra]
+            comprimento_atual = tamanho_palavra
+
+    if linha_atual:
+        linhas.append(" ".join(linha_atual))
+
+    return linhas
 
 
 class PhotoshopEngine:
@@ -1278,83 +1307,90 @@ class PhotoshopEngine:
                 return True
         return False
 
-    def aplicar_texto_com_ajuste_veloz(self, layer, texto: str, largura_colisao: float, largura_original: float, altura_original: float):
+    def aplicar_texto_com_quebra_sob_demanda(self, layer, texto: str, largura_colisao: float, largura_original: float, altura_original: float = 0.0):
         """
-        Atualiza uma camada de texto aplicando colisão, redução gradual de fonte e 
-        ajuste de entrelinha (leading) totalmente calculados em memória (offline).
-        Faz EXATAMENTE UMA chamada de escrita COM para o Photoshop, eliminando travamentos.
+        Atualiza a camada de texto aplicando quebra de linha física (\n/\r) sob demanda.
+        Aplica as quebras estritamente após o 2º espaço ou após o 1º espaço se colidir.
         """
         text_item = layer.TextItem
-        
-        # 1. Leitura rápida inicial (poucas chamadas COM)
         try:
-            tamanho_original = float(text_item.Size)
+            tamanho_fonte = float(text_item.Size)
             tipo_texto = int(text_item.Kind)
         except Exception as e:
-            # Fallback de segurança caso a leitura do objeto de texto falhe
             text_item.Contents = texto
-            self.logger.warning(f"Falha ao ler propriedades da camada de texto: {e}. Aplicando texto bruto.")
+            self.logger.warning(f"Falha ao ler propriedades tipográficas da camada: {e}")
             return
 
-        # Se não for texto de parágrafo (ParagraphText = 2 no Photoshop COM), apenas escreve o texto
-        if tipo_texto != 2:
-            text_item.Contents = texto
-            return
-
-        # 2. Definição de limites e parâmetros de simulação
-        tamanho_atual = tamanho_original
-        limite_minimo = tamanho_original * 0.60   # Permite reduzir a fonte em até 40%
-        proporcao_caractere = 0.52                # Largura estimada de cada caractere (fontes condensadas)
+        proporcao_caractere = 0.52  # Estimativa média de largura de caractere da fonte do encarte
         
-        # Identifica a maior palavra para evitar quebra no meio das palavras (ex: "SOYA", "MOCOCA")
+        # 1. TENTATIVA 1: Testar o texto inteiro em uma única linha
+        largura_estimada_total = len(texto) * (tamanho_fonte * proporcao_caractere)
+        
+        if largura_estimada_total <= largura_colisao:
+            # Cabe perfeitamente sem colisão! Não quebra nada.
+            text_item.Contents = texto
+            self.logger.info(f"Slot '{texto[:15]}...' aplicado em linha única (sem colisão).")
+            return
+
+        # Se colidir, precisamos aplicar as regras de quebra física sob demanda
         palavras = texto.split()
-        comprimento_maior_palavra = max(len(p) for p in palavras) if palavras else 0
 
-        tamanho_calculado = tamanho_original
-        largura_calculada = largura_colisao
-        ajustado = False
-
-        # 3. Laço de ajuste geométrico em memória (Executa em microssegundos!)
-        # Reduz a fonte de 1.0 em 1.0 ponto virtualmente
-        for t in range(int(tamanho_original), int(limite_minimo), -1):
-            t_teste = float(t)
+        # 2. TENTATIVA 2: Quebra após o segundo espaço (se houver pelo menos 3 palavras)
+        if len(palavras) >= 3:
+            linha1 = " ".join(palavras[:2])
+            linha2 = " ".join(palavras[2:])
             
-            # Calcula o ganho proporcional de largura:
-            # Quanto menor a fonte, menor o perigo de colisão. Ganhamos folga para abrir a caixa.
-            proporcao_reducao = (tamanho_original - t_teste) / tamanho_original
-            compensacao_largura = (largura_original - largura_colisao) * (proporcao_reducao * 0.6)
-            largura_teste = min(largura_colisao + compensacao_largura, largura_original)
+            # Medimos se a linha mais longa desse novo bloco cabe na largura útil
+            comprimento_maximo_linha = max(len(linha1), len(linha2))
+            largura_estimada_quebra2 = comprimento_maximo_linha * (tamanho_fonte * proporcao_caractere)
             
-            # Estima se a maior palavra cabe sem estourar o limite da caixa lateralmente
-            largura_estimada_palavra = comprimento_maior_palavra * (t_teste * proporcao_caractere)
+            if largura_estimada_quebra2 <= largura_colisao:
+                texto_final = f"{linha1}\r{linha2}"
+                text_item.Contents = texto_final
+                text_item.UseAutoLeading = False
+                text_item.Leading = tamanho_fonte * 1.10
+                if tipo_texto == 2 and altura_original > 0:
+                    try:
+                        text_item.Width = largura_colisao
+                        text_item.Height = altura_original
+                    except Exception:
+                        pass
+                self.logger.info(f"Slot '{texto[:15]}...' quebrado após o SEGUNDO espaço devido a colisão.")
+                return
+
+        # 3. TENTATIVA 3: Quebra após o primeiro espaço (se houver pelo menos 2 palavras)
+        if len(palavras) >= 2:
+            linha1 = palavras[0]
+            linha2 = " ".join(palavras[1:])
             
-            if largura_estimada_palavra <= largura_teste:
-                tamanho_calculado = t_teste
-                largura_calculada = largura_teste
-                ajustado = True
-                break
+            texto_final = f"{linha1}\r{linha2}"
+            comprimento_maximo_linha = max(len(linha1), len(linha2))
+            largura_estimada_quebra3 = comprimento_maximo_linha * (tamanho_fonte * proporcao_caractere)
+            
+            # Ajuste de fonte proporcional se ainda assim a linha 2 for muito longa
+            if largura_estimada_quebra3 > largura_colisao:
+                fator = max(0.65, min(1.0, largura_colisao / largura_estimada_quebra3))
+                tamanho_fonte = tamanho_fonte * fator
 
-        # Caso o texto seja absurdamente longo e não caiba nem no limite mínimo
-        if not ajustado:
-            tamanho_calculado = limite_minimo
-            proporcao_reducao = (tamanho_original - limite_minimo) / tamanho_original
-            compensacao_largura = (largura_original - largura_colisao) * (proporcao_reducao * 0.6)
-            largura_calculada = min(largura_colisao + compensacao_largura, largura_original)
+            text_item.Contents = texto_final
+            text_item.UseAutoLeading = False
+            text_item.Size = tamanho_fonte
+            text_item.Leading = tamanho_fonte * 1.10
+            if tipo_texto == 2 and altura_original > 0:
+                try:
+                    text_item.Width = largura_colisao
+                    text_item.Height = altura_original
+                except Exception:
+                    pass
+            self.logger.info(f"Slot '{texto[:15]}...' quebrado após o PRIMEIRO espaço (necessidade secundária).")
+            return
 
-        # 4. Gravação Final Única (O gargalo do COM é resolvido aqui)
-        # Enviamos as novas propriedades de uma só vez para o Photoshop aplicar e renderizar
+        # Se o produto for uma palavra só gigante (ex: 'Amaciante'), apenas insere o texto bruto
         text_item.Contents = texto
-        text_item.UseAutoLeading = False
-        text_item.Size = tamanho_calculado
-        text_item.Leading = tamanho_calculado * 1.12  # Entrelinha perfeita para evitar encavalamento
-        text_item.Width = largura_calculada
-        text_item.Height = altura_original
 
-        self.logger.info(
-            f"Slot atualizado: '{texto[:15]}...' | "
-            f"Fonte original {tamanho_original}pt -> Aplicada {tamanho_calculado}pt | "
-            f"Caixa original {largura_original}px -> Colisão/Ajuste {largura_calculada:.1f}px"
-        )
+    def aplicar_texto_com_ajuste_veloz(self, layer, texto: str, largura_colisao: float, largura_original: float, altura_original: float = 0.0):
+        """Alias para manter compatibilidade."""
+        return self.aplicar_texto_com_quebra_sob_demanda(layer, texto, largura_colisao, largura_original, altura_original)
 
     def fit_description_with_collision_v2(
         self,
@@ -1451,6 +1487,9 @@ class PhotoshopEngine:
             if not has_lower_blocker:
                 safe_height = max(78.0, safe_height)
 
+            # Registra as métricas de colisão estritamente nos logs (NUNCA na camada do Photoshop)
+            self.logger.info(f"[COLLISION] Largura calculada: {safe_width:.1f}px, Altura: {safe_height:.1f}px")
+
             # Executa o ajuste ultra-veloz em memória (sem loops de COM)
             self.aplicar_texto_com_ajuste_veloz(
                 layer=description_layer,
@@ -1462,7 +1501,10 @@ class PhotoshopEngine:
 
             report["success"] = True
             report["message"] = "OK"
-            report["final_text"] = offer_name
+            try:
+                report["final_text"] = str(getattr(description_layer.TextItem, "Contents", offer_name))
+            except Exception:
+                report["final_text"] = offer_name
             try:
                 report["final_font_size"] = float(description_layer.TextItem.Size)
             except Exception:
@@ -1806,9 +1848,9 @@ class PhotoshopEngine:
                 logger.warning("Could not find PSD slot group for slot %s", target_slot)
                 return False
 
-            product_name = self.description_recommendations.get(
-                int(target_slot), getattr(offer, "nome", "") or ""
-            )
+            # O nome do produto deve ser estritamente o da oferta (planilha/IA ortográfica),
+            # eliminando qualquer risco de vazamento de debug ou alucinações de layout.
+            product_name = getattr(offer, "nome", "") or ""
             changed = False
             shape_references = self._shape_references(group)
             price_group = self._find_price_group(group)

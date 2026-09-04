@@ -170,13 +170,16 @@ class GenerationWorkflow:
             if not item.imagem and item.nome:
                 item.imagem = loader.ensure_placeholder_image(self.products_dir, item.nome, item.nome)
 
-        ollama = AIOfferGenerator(load_settings())
-        if ollama.is_available():
-            logger.info("Ollama name optimization enabled (model=%s)", ollama.model)
+        # 3. Intercepta o fluxo para aplicar a IA do Ollama se estiver ativa
+        config = load_settings()
+        ai_config = config.get("ollama", {})
+        if ai_config.get("enabled", False):
+            logger.info("Iniciando otimização automática de descrições com IA (Ollama)...")
+            ai_generator = AIOfferGenerator(config)
             for item in items:
-                item.nome = ollama.optimize_offer_name(item)
+                item.nome = ai_generator.otimizar_nome_produto(item)
         else:
-            logger.info("Ollama name optimization unavailable; original offer names retained")
+            logger.info("Ollama desativado; mantendo nomes originais das ofertas.")
 
         validation = Validator.validate_offers(items, products_dir=self.products_dir)
 
@@ -306,7 +309,7 @@ class GenerationWorkflow:
         if not suggestion:
             return
         from .product_abbreviator import quebrar_linhas_inteligente
-        # Se o Ollama enviou texto formatado com quebras inteligentes, adote-o!
+        # Se o Ollama enviou texto formatado com quebras inteligentes, só adota se não contiver métricas de debug
         formatted = suggestion.get("formatted_text")
         if formatted and str(formatted).strip():
             clean = (
@@ -318,8 +321,25 @@ class GenerationWorkflow:
                 .replace("\r\n", "\r")
                 .replace("\n", "\r")
             )
-            group.recommended_text = clean
-            group.needs_line_break = "\r" in group.recommended_text
+            lower_clean = clean.lower()
+            is_debug = any(
+                w in lower_clean
+                for w in (
+                    "largura",
+                    "altura",
+                    "distância",
+                    "distancia",
+                    "px",
+                    "colisão",
+                    "colisao",
+                    "versão compactada",
+                    "opção",
+                    "aqui estão",
+                )
+            )
+            if not is_debug and len(clean) <= len(group.recommended_text or "") * 1.3:
+                group.recommended_text = clean
+                group.needs_line_break = "\r" in group.recommended_text
         elif suggestion.get("needs_line_break"):
             group.needs_line_break = True
             if "\r" not in (group.recommended_text or ""):

@@ -22,7 +22,7 @@ ai:
 
 ollama:
   enabled: true
-  host: http://localhost:11434
-  model: llama3.2
-  temperature: 0.3
+  host: "http://localhost:11434"
+  model: "llama3.2"
+  temperature: 0.2
   timeout: 60

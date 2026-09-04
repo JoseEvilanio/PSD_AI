@@ -12,6 +12,7 @@ from core.data_loader import DataLoader
 from core.template_manager import TemplateManager
 from core.validator import Validator
 from core.workflow import GenerationWorkflow
+from ui.loading_overlay import PhotoshopLoadingOverlay
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,8 @@ class MainWindow(tk.Tk):
         self.title("Autoflyer")
         self.geometry("820x500")
         self.minsize(700, 420)
+
+        self.loading_overlay = PhotoshopLoadingOverlay(self, tema_escuro=True)
 
         self.base_dir = Path(__file__).resolve().parent.parent
         self.templates_dir = self.base_dir / "data" / "templates"
@@ -154,6 +157,10 @@ class MainWindow(tk.Tk):
             messagebox.showwarning("Dados incompletos", "Selecione o template e a planilha antes de gerar.")
             return
 
+        # 1. Abre a animação de loading na tela
+        self.loading_overlay.iniciar("Conectando ao Photoshop e preparando dados...")
+        self.status_var.set("Gerando arte...")
+
         def task() -> None:
             try:
                 if self.image_search_dir is None or not self.image_search_dir.is_dir():
@@ -169,11 +176,14 @@ class MainWindow(tk.Tk):
                 output = result.output_path or (self.base_dir / "data" / "outputs" / (self.template_path.stem + "_gerado.jpg"))
 
                 self.status_var.set(f"Arte gerada com sucesso: {output.name}")
-                messagebox.showinfo("Sucesso", f"Arte exportada em:\n{output}")
+                self.after(0, lambda: messagebox.showinfo("Sucesso", f"Arte exportada em:\n{output}"))
             except Exception as exc:  # pragma: no cover - UI feedback only
                 logger.exception("Erro ao gerar arte")
                 self.status_var.set("Erro ao gerar arte.")
-                messagebox.showerror("Erro", str(exc))
+                self.after(0, lambda e=exc: messagebox.showerror("Erro", str(e)))
+            finally:
+                # 4. Fecha a animação automaticamente ao finalizar (com sucesso ou erro)
+                self.after(0, self.loading_overlay.fechar)
 
+        # 2. Executa em Thread separada para manter a animação fluida
         threading.Thread(target=task, daemon=True).start()
-        self.status_var.set("Gerando arte...")
