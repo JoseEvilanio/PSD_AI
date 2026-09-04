@@ -7,10 +7,117 @@ import re
 import shutil
 import time
 import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from .product_abbreviator import abreviar_produto, quebrar_linhas_inteligente
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Bounds:
+    left: float
+    top: float
+    right: float
+    bottom: float
+
+    @property
+    def width(self) -> float:
+        return self.right - self.left
+
+    @property
+    def height(self) -> float:
+        return self.bottom - self.top
+
+    @property
+    def center_x(self) -> float:
+        return (self.left + self.right) / 2.0
+
+    @property
+    def center_y(self) -> float:
+        return (self.top + self.bottom) / 2.0
+
+    def expand(self, margin: float) -> "Bounds":
+        return Bounds(self.left - margin, self.top - margin, self.right + margin, self.bottom + margin)
+
+    def intersects(self, other: "Bounds") -> bool:
+        return not (
+            self.right < other.left or
+            self.left > other.right or
+            self.bottom < other.top or
+            self.top > other.bottom
+        )
+
+    def horizontal_overlap(self, other: "Bounds") -> float:
+        return max(0.0, min(self.right, other.right) - max(self.left, other.left))
+
+    def vertical_overlap(self, other: "Bounds") -> float:
+        return max(0.0, min(self.bottom, other.bottom) - max(self.top, other.top))
+
+
+def _could_collide_horizontally(a: Bounds, b: Bounds) -> bool:
+    return a.vertical_overlap(b) > min(a.height, b.height) * 0.25
+
+
+def _could_collide_vertically(a: Bounds, b: Bounds) -> bool:
+    return a.horizontal_overlap(b) > min(a.width, b.width) * 0.25
+
+
+def calculate_safe_text_box(
+    description_bounds: Bounds,
+    neighbors: list[tuple[str, Bounds]],
+    min_margin: float = 4.0,
+    extra_margin_for_images: float = 6.0,
+    extra_margin_for_prices: float = 3.0,
+    allow_sides: Optional[dict[str, bool]] = None,
+) -> Bounds:
+    if allow_sides is None:
+        allow_sides = {"left": True, "right": True, "top": True, "bottom": True}
+
+    safe = Bounds(description_bounds.left, description_bounds.top, description_bounds.right, description_bounds.bottom)
+
+    for name, neighbor in neighbors:
+        name_lower = (name or "").lower()
+        margin = min_margin
+        if any(token in name_lower for token in ("smart", "image", "foto", "img", "product", "produto")):
+            margin = extra_margin_for_images
+        elif any(token in name_lower for token in ("preço", "preco", "price", "r$", "de", "por", "unidade", "un", "kg", "ml", "unit")):
+            margin = extra_margin_for_prices
+
+        expanded = neighbor.expand(margin)
+        if expanded.intersects(safe) or _could_collide_horizontally(safe, expanded):
+            if expanded.right <= safe.center_x and allow_sides.get("left", True):
+                new_left = max(safe.left, expanded.right)
+                if new_left < safe.right - 20:
+                    safe.left = new_left
+            elif expanded.left >= safe.center_x and allow_sides.get("right", True):
+                new_right = min(safe.right, expanded.left)
+                if new_right > safe.left + 20:
+                    safe.right = new_right
+
+        if expanded.intersects(safe) or _could_collide_vertically(safe, expanded):
+            if expanded.bottom <= safe.center_y and allow_sides.get("top", True):
+                new_top = max(safe.top, expanded.bottom)
+                if new_top < safe.bottom - 15:
+                    safe.top = new_top
+            elif expanded.top >= safe.center_y and allow_sides.get("bottom", True):
+                new_bottom = min(safe.bottom, expanded.top)
+                if new_bottom > safe.top + 15:
+                    safe.bottom = new_bottom
+
+    min_w, min_h = 40.0, 20.0
+    if safe.width < min_w:
+        mid = safe.center_x
+        safe.left = mid - min_w / 2.0
+        safe.right = mid + min_w / 2.0
+    if safe.height < min_h:
+        mid = safe.center_y
+        safe.top = mid - min_h / 2.0
+        safe.bottom = mid + min_h / 2.0
+
+    return safe
 
 
 class PhotoshopEngine:
@@ -22,12 +129,19 @@ class PhotoshopEngine:
     """
 
     def __init__(self, visible: bool = True, display_dialogs: bool = False):
+        self.logger = logger
         self.visible = visible
         self.display_dialogs = display_dialogs
         self.app: Optional[Any] = None
         self.template_path: Optional[Path] = None
         self.photoshop_installed = self._is_photoshop_installed()
         self.com_error: Optional[str] = None
+        self.native_layer_tree: Optional[dict[str, Any]] = None
+        self._native_layer_index: dict[Any, dict[str, Any]] = {}
+        self.description_recommendations: dict[int, str] = {}
+        self.description_font_scales: dict[int, float] = {}
+        self.description_line_spacing_scales: dict[int, float] = {}
+        self.ai_provider: Optional[Any] = None
         self._connect()
 
     @staticmethod
@@ -174,10 +288,15 @@ class PhotoshopEngine:
             "opacity": cls._com_value(getattr(layer, "Opacity", None)),
             "bounds": list(bounds) if bounds is not None else None,
             "text": None,
+            "font_size": None,
+            "is_text": cls._is_text_layer(layer),
+            "is_smart_object": cls._com_value(getattr(layer, "Kind", None)) == 17,
+            "is_shape": cls._is_shape_name(getattr(layer, "Name", "")),
             "children": [],
         }
         if cls._is_text_layer(layer):
             node["text"] = cls._text_content(layer)
+            node["font_size"] = cls._com_value(getattr(getattr(layer, "TextItem", None), "Size", None))
 
         collection_names = ("Layers",) if str(getattr(layer, "typename", "")) == "Document" else ("LayerSets", "ArtLayers")
         for collection_name in collection_names:
@@ -216,9 +335,73 @@ class PhotoshopEngine:
             logger.warning("Could not inspect the native Photoshop document: %s", exc)
             return None
 
+    def snapshot_native_layer_tree(self) -> Optional[dict[str, Any]]:
+        """Read the complete document tree once and index its structured nodes."""
+        self.native_layer_tree = self.get_native_layer_tree()
+        self._native_layer_index = {}
+
+        def visit(node: dict[str, Any]) -> None:
+            if node.get("id") is not None:
+                self._native_layer_index[node["id"]] = node
+            for child in node.get("children", []):
+                if isinstance(child, dict):
+                    visit(child)
+
+        if self.native_layer_tree:
+            for node in self.native_layer_tree.get("layers", []):
+                visit(node)
+        return self.native_layer_tree
+
+    def _native_slot_node(self, slot_number: int) -> Optional[dict[str, Any]]:
+        target = str(slot_number)
+        padded = target.zfill(2)
+        for node in self._native_layer_index.values():
+            name = str(node.get("name", "")).strip()
+            if not re.search(r"(?:^|[_ -])(?:%s|%s)$" % (re.escape(target), re.escape(padded)), name, re.IGNORECASE):
+                continue
+            upper = name.upper()
+            if (
+                re.search(r"^(?:GRUPO|GROUP|PRODUCT|PRODUTO)\s*[_-]?\s*\d+$", upper)
+                or ("DESCRI" in upper and "PRE" in upper)
+            ):
+                return node
+        return None
+
+    def _layer_from_native_node(self, node: Optional[dict[str, Any]]) -> Any:
+        if not node or node.get("id") is None or self.app is None:
+            return None
+        target_id = node["id"]
+        for layer in self._iter_layers(self.app.ActiveDocument):
+            if self._com_value(getattr(layer, "ID", None)) == target_id:
+                return layer
+        return None
+
+    @staticmethod
+    def _native_description_node(group_node: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not group_node:
+            return None
+        candidates: list[dict[str, Any]] = []
+
+        def visit(node: dict[str, Any]) -> None:
+            if node.get("is_text"):
+                text = str(node.get("text") or "").strip()
+                upper = text.upper()
+                if (
+                    len(text) > 6
+                    and not re.fullmatch(r"[\d,.]+", text)
+                    and not any(token in upper for token in ("R$", "DE:", "POR:", "UN", "KG", "LT", "CX", ",99", ",49"))
+                ):
+                    candidates.append(node)
+            for child in node.get("children", []):
+                if isinstance(child, dict):
+                    visit(child)
+
+        visit(group_node)
+        return max(candidates, key=lambda node: len(str(node.get("text") or "")), default=None)
+
     def export_native_layer_tree_json(self, output_path: str | Path) -> Optional[Path]:
         """Save the open Photoshop DOM tree as UTF-8 JSON, when COM is available."""
-        tree = self.get_native_layer_tree()
+        tree = self.native_layer_tree or self.snapshot_native_layer_tree()
         if tree is None:
             return None
         target = Path(output_path).resolve()
@@ -439,13 +622,21 @@ class PhotoshopEngine:
         except Exception:
             return False
 
+    @staticmethod
+    def _normalize_text_breaks(text: str) -> str:
+        s = str(text or "")
+        s = s.replace("\\r\\n", "\r").replace("\\r", "\r").replace("\\n", "\r")
+        s = s.replace("\r\n", "\r").replace("\n", "\r")
+        s = re.sub(r"\r+", "\r", s).strip("\r")
+        return s
+
     def _apply_text_value(self, layer: Any, value: str) -> bool:
         if layer is None or not self._is_text_layer(layer):
             return False
         try:
-            expected = str(value)
+            expected = self._normalize_text_breaks(value)
             layer.TextItem.Contents = expected
-            actual = str(layer.TextItem.Contents)
+            actual = self._normalize_text_breaks(getattr(layer.TextItem, "Contents", ""))
             if actual != expected:
                 logger.warning(
                     "Photoshop did not confirm text change on layer '%s' (expected '%s', got '%s')",
@@ -457,6 +648,830 @@ class PhotoshopEngine:
         except Exception as exc:  # pragma: no cover - COM fallback
             logger.warning("Failed to set text on layer '%s': %s", getattr(layer, "Name", ""), exc)
             return False
+
+    def _enable_auto_leading_and_wrap(self, layer: Any) -> None:
+        if layer is None or not self._is_text_layer(layer):
+            return
+        try:
+            text_item = getattr(layer, "TextItem", None)
+            if text_item is not None:
+                text_item.UseAutoLeading = True
+                text_item.ParagraphJustification = 1
+        except Exception:
+            pass
+
+    def _set_font_size(self, layer: Any, font_size: float) -> float:
+        if layer is None or not self._is_text_layer(layer):
+            return 0.0
+        try:
+            text_item = getattr(layer, "TextItem", None)
+            if text_item is None:
+                return 0.0
+            size_value = max(1.0, float(font_size))
+            text_item.Size = size_value
+            current = float(getattr(text_item, "Size", size_value) or size_value)
+            return current
+        except Exception as exc:  # pragma: no cover - COM fallback
+            logger.warning("Failed to set font size on layer '%s': %s", getattr(layer, "Name", ""), exc)
+            return 0.0
+
+    def _get_font_size(self, layer: Any) -> Optional[float]:
+        if layer is None or not self._is_text_layer(layer):
+            return None
+        try:
+            size = getattr(getattr(layer, "TextItem", None), "Size", None)
+            return float(getattr(size, "Value", size)) if size is not None else None
+        except Exception:
+            return None
+
+    def _set_tracking(self, layer: Any, value: int) -> None:
+        if layer is None or not self._is_text_layer(layer):
+            return
+        try:
+            text_item = getattr(layer, "TextItem", None)
+            if text_item is not None:
+                text_item.Tracking = int(value)
+        except Exception:
+            pass
+
+    def _set_leading(self, layer: Any, value: float) -> None:
+        if layer is None or not self._is_text_layer(layer):
+            return
+        try:
+            text_item = getattr(layer, "TextItem", None)
+            if text_item is not None:
+                text_item.AutoLeading = False
+                text_item.Leading = max(1.0, float(value))
+        except Exception:
+            pass
+
+    def _try_convert_to_paragraph_text(self, layer: Any, width: float) -> bool:
+        if layer is None or not self._is_text_layer(layer):
+            return False
+        width_set = False
+        try:
+            text_item = getattr(layer, "TextItem", None)
+            if text_item is None:
+                return False
+            try:
+                text_item.Width = max(1.0, float(width))
+                width_set = True
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return width_set
+
+    def _restore_full_description(self, layer: Any, text: str, width: float, font_size: float) -> None:
+        wrapped = self._normalize_text_breaks(text)
+        self._clear_and_set_text(layer, wrapped)
+        try:
+            layer.Visible = True
+        except Exception:
+            pass
+        self._force_photoshop_update()
+
+    @staticmethod
+    def _wrap_text_for_width(text: str, width: float, font_size: float, tracking: int = 0) -> str:
+        average_char_width = max(font_size * 0.55 + tracking / 100.0, 1.0)
+        max_chars = max(8, int(width / average_char_width))
+
+        wrapped_paragraphs: list[str] = []
+        for paragraph in str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            words = paragraph.split()
+            lines: list[str] = []
+            current: list[str] = []
+            current_length = 0
+            for word in words:
+                added_length = len(word) if not current else len(word) + 1
+                if current and current_length + added_length > max_chars:
+                    lines.append(" ".join(current))
+                    current = []
+                    current_length = 0
+                current.append(word)
+                current_length += len(word) if current_length == 0 else len(word) + 1
+            if current:
+                lines.append(" ".join(current))
+            wrapped_paragraphs.append("\r".join(lines))
+
+        wrapped = "\r".join(wrapped_paragraphs)
+        return wrapped or str(text)
+
+    @staticmethod
+    def _break_description_after_second_space(text: str) -> str:
+        """Keep the first two words together, then start the remaining text below."""
+        value = str(text or "").strip()
+        first_space = value.find(" ")
+        if first_space < 0:
+            return value
+        second_space = value.find(" ", first_space + 1)
+        if second_space < 0:
+            return value
+        return value[:second_space] + "\r" + value[second_space + 1:]
+
+    @staticmethod
+    def _horizontal_gap(left: tuple[float, float, float, float], right: tuple[float, float, float, float]) -> float:
+        """Return the horizontal distance between two boxes, or zero when they overlap."""
+        return max(0.0, right[0] - left[2], left[0] - right[2])
+
+    def _get_rendered_text_bounds(self, layer: Any) -> Optional[tuple[float, float, float, float]]:
+        if layer is None or not self._is_text_layer(layer):
+            return None
+        try:
+            self._enable_auto_leading_and_wrap(layer)
+            bounds = getattr(layer, "Bounds", None)
+            if bounds is None:
+                return None
+            values = []
+            for value in bounds:
+                values.append(float(getattr(value, "Value", value)))
+            if len(values) == 4:
+                return tuple(values)
+        except Exception:
+            return None
+        return None
+
+    def _calculate_safe_text_box(
+        self,
+        group: Any,
+        description_layer: Any,
+        min_margin: float = 4.0,
+    ) -> Optional[tuple[float, float, float, float]]:
+        if description_layer is None:
+            return None
+        description_bounds = self._bounds_signature(description_layer)
+        if description_bounds is None:
+            return None
+
+        neighbors: list[tuple[str, Bounds]] = []
+        for layer in self._iter_layers(group):
+            if layer is description_layer or not bool(getattr(layer, "Visible", True)):
+                continue
+            if not (self._is_text_layer(layer) or int(getattr(layer, "Kind", 0)) == 17):
+                continue
+            blocker_bounds = self._bounds_signature(layer)
+            if blocker_bounds is not None and self._valid_bounds(blocker_bounds):
+                neighbors.append((str(getattr(layer, "Name", "") or "layer"), Bounds(*blocker_bounds)))
+
+        if not neighbors:
+            return tuple(description_bounds)
+
+        safe_box = calculate_safe_text_box(
+            description_bounds=Bounds(*description_bounds),
+            neighbors=neighbors,
+            min_margin=min_margin,
+            extra_margin_for_images=8.0,
+            extra_margin_for_prices=3.5,
+        )
+        return (
+            safe_box.left,
+            safe_box.top,
+            safe_box.right,
+            safe_box.bottom,
+        )
+
+    def _adjust_text_layer_to_fit(
+        self,
+        layer: Any,
+        max_width: float,
+        max_height: float,
+        original_font_size: float,
+        min_scale: float = 0.55,
+        max_scale: float = 1.15,
+        tolerance: float = 0.5,
+        max_iterations: int = 12,
+    ) -> float:
+        if layer is None or not self._is_text_layer(layer):
+            return float(original_font_size or 0.0)
+
+        current_size = float(getattr(getattr(layer, "TextItem", None), "Size", original_font_size) or original_font_size or 0.0)
+        if current_size <= 0:
+            return 0.0
+        self._enable_auto_leading_and_wrap(layer)
+
+        min_size = max(1.0, current_size * min_scale)
+        max_size = max(current_size, current_size * max_scale)
+        best_size = current_size
+        low = min_size
+        high = max_size
+
+        for _ in range(max_iterations):
+            mid = (low + high) / 2.0
+            self._set_font_size(layer, mid)
+            bounds = self._get_rendered_text_bounds(layer)
+            if bounds is None:
+                break
+            width = max(bounds[2] - bounds[0], 1.0)
+            height = max(bounds[3] - bounds[1], 1.0)
+            width_ok = width <= max_width + tolerance
+            height_ok = height <= max_height + tolerance
+            if width_ok and height_ok:
+                best_size = mid
+                low = mid
+            else:
+                high = mid
+            if high - low < 0.3:
+                break
+
+        final_size = max(1.0, float(best_size))
+        self._set_font_size(layer, final_size)
+        return final_size
+
+    def _fit_description_layer_with_collision(
+        self,
+        group: Any,
+        description_layer: Any,
+        description_bounds: tuple[float, float, float, float],
+        shape_references: list[tuple[float, float, float, float]],
+        blocking_bounds: list[tuple[float, float, float, float]],
+        target_slot: int,
+    ) -> None:
+        target_fit_box = None
+        if shape_references:
+            description_shape = min(
+                shape_references,
+                key=lambda shape: (
+                    ((shape[0] + shape[2]) / 2.0 - (description_bounds[0] + description_bounds[2]) / 2.0) ** 2
+                    + ((shape[1] + shape[3]) / 2.0 - (description_bounds[1] + description_bounds[3]) / 2.0) ** 2
+                ),
+            )
+            target_fit_box = self._description_safe_bounds(
+                description_bounds,
+                description_shape,
+                blocking_bounds,
+            )
+
+        safe_slot_box = self._calculate_safe_text_box(group, description_layer, min_margin=4.0)
+        if safe_slot_box is not None:
+            target_fit_box = safe_slot_box
+        elif target_fit_box is None:
+            target_fit_box = self._description_safe_bounds(
+                description_bounds,
+                description_bounds,
+                blocking_bounds,
+            )
+
+        self._fit_text_to_bounds(
+            description_layer,
+            target_fit_box,
+            description_bounds,
+            horizontal_center=(target_fit_box[0] + target_fit_box[2]) / 2.0,
+            blocking_bounds=blocking_bounds,
+        )
+
+        max_width = max(target_fit_box[2] - target_fit_box[0], 1.0)
+        max_height = max(target_fit_box[3] - target_fit_box[1], 1.0)
+        original_font_size = float(getattr(description_layer.TextItem, "Size", 0) or 0)
+        if original_font_size <= 0:
+            return
+
+        bounds_after_wrap = self._get_rendered_text_bounds(description_layer)
+        if bounds_after_wrap is None:
+            return
+
+        measured_width = max(bounds_after_wrap[2] - bounds_after_wrap[0], 1.0)
+        measured_height = max(bounds_after_wrap[3] - bounds_after_wrap[1], 1.0)
+        if measured_width <= max_width + 0.5 and measured_height <= max_height + 0.5:
+            return
+
+        final_size = self._adjust_text_layer_to_fit(
+            description_layer,
+            max_width=max_width,
+            max_height=max_height,
+            original_font_size=original_font_size,
+            min_scale=0.55,
+            max_scale=1.15,
+            tolerance=0.5,
+            max_iterations=12,
+        )
+        if final_size < original_font_size * 0.85:
+            logger.warning(
+                "Description '%s' was shrunk to %.1f px to fit the safe box in slot %s.",
+                getattr(description_layer, "Name", ""),
+                final_size,
+                target_slot,
+            )
+
+    def _force_photoshop_update(self) -> None:
+        if self.app is None:
+            return
+        try:
+            self.app.Refresh()
+        except Exception:
+            pass
+
+    def _compress_and_position_text(self, layer: Any, target: Bounds) -> bool:
+        if self.app is None or layer is None:
+            return False
+        try:
+            layer_id = int(getattr(layer, "ID"))
+        except Exception:
+            return False
+
+        script = (
+            "function findLayer(container, targetId) {"
+            "  for (var i = 0; i < container.layers.length; i++) {"
+            "    var candidate = container.layers[i];"
+            "    if (candidate.id == targetId) return candidate;"
+            "    if (candidate.typename == 'LayerSet') {"
+            "      var nested = findLayer(candidate, targetId);"
+            "      if (nested) return nested;"
+            "    }"
+            "  }"
+            "  return null;"
+            "}"
+            "function px(value) { return value.as('px'); }"
+            "var fittedLayer = findLayer(app.activeDocument, " + str(layer_id) + ");"
+            "if (!fittedLayer) throw new Error('Text layer not found for compression');"
+            "var bounds = fittedLayer.bounds;"
+            "var left = px(bounds[0]);"
+            "var top = px(bounds[1]);"
+            "var right = px(bounds[2]);"
+            "var bottom = px(bounds[3]);"
+            "var width = Math.max(right - left, 1);"
+            "var height = Math.max(bottom - top, 1);"
+            "var targetWidth = Math.max(" + str(target.width) + " * 0.96, 1);"
+            "var targetHeight = Math.max(" + str(target.height) + " * 0.96, 1);"
+            "var scaleX = Math.min(100, targetWidth / width * 100);"
+            "var scaleY = Math.min(100, targetHeight / height * 100);"
+            "if (scaleX < 99.9 || scaleY < 99.9) fittedLayer.resize(scaleX, scaleY, AnchorPosition.MIDDLECENTER);"
+            "bounds = fittedLayer.bounds;"
+            "left = px(bounds[0]); top = px(bounds[1]); right = px(bounds[2]); bottom = px(bounds[3]);"
+            "var centerX = (left + right) / 2;"
+            "var centerY = (top + bottom) / 2;"
+            "var targetCenterX = " + str(target.center_x) + ";"
+            "var targetCenterY = " + str(target.center_y) + ";"
+            "var dx = targetCenterX - centerX;"
+            "var dy = targetCenterY - centerY;"
+            "if (left + dx < " + str(target.left) + ") dx += " + str(target.left) + " - (left + dx);"
+            "if (right + dx > " + str(target.right) + ") dx -= (right + dx) - " + str(target.right) + ";"
+            "if (top + dy < " + str(target.top) + ") dy += " + str(target.top) + " - (top + dy);"
+            "if (bottom + dy > " + str(target.bottom) + ") dy -= (bottom + dy) - " + str(target.bottom) + ";"
+            "fittedLayer.translate(new UnitValue(dx, 'px'), new UnitValue(dy, 'px'));"
+        )
+        try:
+            self.app.DoJavaScript(script)
+            self._force_photoshop_update()
+            return True
+        except Exception as exc:
+            logger.warning("Could not compress and position text layer '%s': %s", getattr(layer, "Name", ""), exc)
+            return False
+
+    def _get_accurate_text_bounds(self, layer: Any) -> Optional[tuple[float, float, float, float]]:
+        if layer is None or not self._is_text_layer(layer):
+            return None
+        try:
+            self._force_photoshop_update()
+            bounds = getattr(layer, "Bounds", None)
+            if bounds is None:
+                return None
+            values = [float(getattr(value, "Value", value)) for value in bounds]
+            if len(values) == 4:
+                return tuple(values)
+        except Exception:
+            return None
+        return None
+
+    def _find_best_text_area(self, group: Any, description_layer: Any) -> Optional[Bounds]:
+        candidates: list[Bounds] = []
+        for layer in self._get_visible_layers_in_group(group):
+            if layer is description_layer:
+                continue
+            name = str(getattr(layer, "Name", "") or "").lower()
+            if not any(token in name for token in ("shape", "rectangle", "retangulo", "ellipse", "elipse", "area", "texto")):
+                continue
+            bounds = self._bounds_signature(layer)
+            if bounds is not None and self._valid_bounds(bounds):
+                candidates.append(Bounds(*bounds))
+
+        if candidates:
+            return max(candidates, key=lambda b: b.width * b.height)
+
+        try:
+            group_bounds = self._bounds_signature(group)
+            if group_bounds is not None:
+                return Bounds(*group_bounds)
+        except Exception:
+            pass
+        return None
+
+    def _get_visible_layers_in_group(self, group: Any) -> list[Any]:
+        result: list[Any] = []
+
+        def walk(node: Any) -> None:
+            if node is None:
+                return
+            try:
+                layers = getattr(node, "Layers", None)
+                if layers is not None:
+                    for i in range(layers.Count):
+                        layer = layers[i]
+                        if layer is None:
+                            continue
+                        if not bool(getattr(layer, "Visible", True)):
+                            continue
+                        if str(getattr(layer, "typename", "")) == "ArtLayer":
+                            result.append(layer)
+                        elif str(getattr(layer, "typename", "")) == "LayerSet":
+                            walk(layer)
+            except Exception:
+                pass
+
+        walk(group)
+        return result
+
+    def _set_text_content(self, layer: Any, text: str) -> None:
+        if layer is None or not self._is_text_layer(layer):
+            return
+        try:
+            layer.TextItem.Contents = str(text)
+        except Exception as exc:
+            logger.warning("Failed to set description content on layer '%s': %s", getattr(layer, "Name", ""), exc)
+
+    def _clear_and_set_text(self, layer: Any, new_text: str) -> None:
+        self._clear_text_layer_completely(layer)
+        self._set_text_content(layer, new_text)
+        self._force_photoshop_update()
+
+    def _clear_text_layer_completely(self, layer: Any) -> None:
+        """Clear stale Photoshop text content before writing the replacement."""
+        if layer is None or not self._is_text_layer(layer):
+            return
+        try:
+            text_item = layer.TextItem
+            text_item.Contents = ""
+            self._force_photoshop_update()
+            text_item.Contents = " "
+            text_item.Contents = ""
+            self._force_photoshop_update()
+        except Exception as exc:
+            logger.warning("Failed to completely clear text layer '%s': %s", getattr(layer, "Name", ""), exc)
+
+    def _enable_paragraph_wrapping(self, layer: Any) -> None:
+        if layer is None or not self._is_text_layer(layer):
+            return
+        try:
+            text_item = getattr(layer, "TextItem", None)
+            if text_item is not None:
+                text_item.UseAutoLeading = True
+                text_item.ParagraphJustification = 1
+        except Exception:
+            pass
+
+    def _get_layer_bounds(self, layer: Any) -> Optional[tuple[float, float, float, float]]:
+        if layer is None:
+            return None
+        try:
+            bounds = getattr(layer, "Bounds", None)
+            if bounds is None:
+                return None
+            values = [float(getattr(value, "Value", value)) for value in bounds]
+            if len(values) == 4:
+                return tuple(values)
+        except Exception:
+            return None
+        return None
+
+    def _should_force_line_break(
+        self,
+        description_layer: Any,
+        group: Any,
+        original_bounds: Optional[tuple[float, float, float, float]] = None,
+    ) -> bool:
+        desc_bounds = original_bounds or self._get_layer_bounds(description_layer)
+        if not desc_bounds:
+            return False
+
+        desc_left, _, desc_right, _ = desc_bounds
+        closest_price_left: Optional[float] = None
+        price_tokens = ("preço", "preco", "por", "r$", "valor", "price", "badge", "de:")
+        numeric_names = {"1", "2", "3", "4", "5", "6", "9", "18", "26"}
+        for layer in self._get_visible_layers_in_group(group):
+            if layer is description_layer:
+                continue
+            name = str(getattr(layer, "Name", "") or "").strip().lower()
+            if not (any(token in name for token in price_tokens) or name in numeric_names):
+                continue
+            bounds = self._get_layer_bounds(layer)
+            if not bounds or bounds[0] <= desc_left:
+                continue
+            if closest_price_left is None or bounds[0] < closest_price_left:
+                closest_price_left = bounds[0]
+
+        return closest_price_left is not None and closest_price_left - desc_right < 4.0
+
+    def _find_closest_price_left(
+        self,
+        group: Any,
+        desc_left: float,
+        group_node: Optional[dict[str, Any]] = None,
+        desc_bounds: Optional[Bounds] = None,
+    ) -> Optional[float]:
+        if group_node is not None:
+            closest: Optional[float] = None
+
+            def visit(node: dict[str, Any]) -> None:
+                nonlocal closest
+                if node.get("is_text"):
+                    text = str(node.get("text") or "").strip().lower()
+                    name = str(node.get("name") or "").strip().lower()
+                    if not (
+                        name.startswith("de") or name.startswith("r$") or name in {"un", "kg", "ml"}
+                        or text.startswith("de") or text.startswith("r$") or text in {"un", "kg", "ml"}
+                    ):
+                        normalized = text.replace(",", "").replace(".", "")
+                        is_price = (
+                            any(token in name or token in text for token in ("preço", "preco", "por", "valor", "price"))
+                            or name.isdigit()
+                            or normalized.isdigit()
+                            or any(token in text for token in (",99", ",49", ",90"))
+                        )
+                        bounds = node.get("bounds")
+                        if is_price and isinstance(bounds, list) and len(bounds) == 4 and bounds[0] > desc_left + 40.0:
+                            v_overlap = 1.0
+                            if desc_bounds is not None:
+                                v_overlap = min(desc_bounds.bottom, float(bounds[3])) - max(desc_bounds.top, float(bounds[1]))
+                            if v_overlap > 0:
+                                if closest is None or bounds[0] < closest:
+                                    closest = float(bounds[0])
+                for child in node.get("children", []):
+                    if isinstance(child, dict):
+                        visit(child)
+
+            visit(group_node)
+            return closest
+
+        closest: Optional[float] = None
+        price_tokens = ("preço", "preco", "por", "valor", "price")
+        numeric_names = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "18", "26"}
+        for layer in self._get_visible_layers_in_group(group):
+            name = str(getattr(layer, "Name", "") or "").strip().lower()
+            if name.startswith("de") or name.startswith("r$") or name in {"un", "kg", "ml"}:
+                continue
+            normalized_name = name.replace(",", "").replace(".", "")
+            is_price = (
+                any(token in name for token in price_tokens)
+                or name in numeric_names
+                or normalized_name.isdigit()
+                or any(token in name for token in (",99", ",49", ",90"))
+            )
+            if not is_price:
+                continue
+            bounds = self._get_layer_bounds(layer)
+            if bounds is None or bounds[0] <= desc_left + 40.0:
+                continue
+            if desc_bounds is not None:
+                v_overlap = min(desc_bounds.bottom, bounds[3]) - max(desc_bounds.top, bounds[1])
+                if v_overlap <= 0:
+                    continue
+            if closest is None or bounds[0] < closest:
+                closest = bounds[0]
+        return closest
+
+    def _force_break_after_second_space(self, text: str) -> str:
+        parts = str(text or "").strip().split()
+        if len(parts) <= 2:
+            return str(text or "").strip()
+        return " ".join(parts[:2]) + "\r" + " ".join(parts[2:])
+
+    @staticmethod
+    def _force_break_after_next_space(text: str) -> str:
+        value = str(text or "")
+        start = value.rfind("\r")
+        search_from = start + 1 if start >= 0 else 0
+        position = value.find(" ", search_from)
+        if position < 0:
+            return value
+        return value[:position] + "\r" + value[position + 1:]
+
+    def _has_surrounding_collision(
+        self,
+        description_layer: Any,
+        group: Any,
+        description_bounds: Optional[tuple[float, float, float, float]] = None,
+    ) -> bool:
+        bounds = description_bounds or self._get_layer_bounds(description_layer)
+        if bounds is None:
+            return False
+        description = Bounds(*bounds)
+        for layer in self._get_visible_layers_in_group(group):
+            if layer is description_layer:
+                continue
+            name = str(getattr(layer, "Name", "") or "").lower()
+            if any(token in name for token in ("shape", "rectangle", "retangulo", "ellipse", "elipse", "smart", "image", "imagem", "foto", "img", "fundo")):
+                continue
+            other_bounds = self._get_layer_bounds(layer)
+            if other_bounds is None:
+                continue
+            other = Bounds(*other_bounds)
+            contains_description = (
+                other.left <= description.left
+                and other.top <= description.top
+                and other.right >= description.right
+                and other.bottom >= description.bottom
+            )
+            if contains_description:
+                continue
+            horizontal_gap = max(0.0, other.left - description.right, description.left - other.right)
+            vertical_overlap = description.vertical_overlap(other)
+            if vertical_overlap > 0 and horizontal_gap < 5.0:
+                return True
+        return False
+
+    def aplicar_texto_com_ajuste_veloz(self, layer, texto: str, largura_colisao: float, largura_original: float, altura_original: float):
+        """
+        Atualiza uma camada de texto aplicando colisão, redução gradual de fonte e 
+        ajuste de entrelinha (leading) totalmente calculados em memória (offline).
+        Faz EXATAMENTE UMA chamada de escrita COM para o Photoshop, eliminando travamentos.
+        """
+        text_item = layer.TextItem
+        
+        # 1. Leitura rápida inicial (poucas chamadas COM)
+        try:
+            tamanho_original = float(text_item.Size)
+            tipo_texto = int(text_item.Kind)
+        except Exception as e:
+            # Fallback de segurança caso a leitura do objeto de texto falhe
+            text_item.Contents = texto
+            self.logger.warning(f"Falha ao ler propriedades da camada de texto: {e}. Aplicando texto bruto.")
+            return
+
+        # Se não for texto de parágrafo (ParagraphText = 2 no Photoshop COM), apenas escreve o texto
+        if tipo_texto != 2:
+            text_item.Contents = texto
+            return
+
+        # 2. Definição de limites e parâmetros de simulação
+        tamanho_atual = tamanho_original
+        limite_minimo = tamanho_original * 0.60   # Permite reduzir a fonte em até 40%
+        proporcao_caractere = 0.52                # Largura estimada de cada caractere (fontes condensadas)
+        
+        # Identifica a maior palavra para evitar quebra no meio das palavras (ex: "SOYA", "MOCOCA")
+        palavras = texto.split()
+        comprimento_maior_palavra = max(len(p) for p in palavras) if palavras else 0
+
+        tamanho_calculado = tamanho_original
+        largura_calculada = largura_colisao
+        ajustado = False
+
+        # 3. Laço de ajuste geométrico em memória (Executa em microssegundos!)
+        # Reduz a fonte de 1.0 em 1.0 ponto virtualmente
+        for t in range(int(tamanho_original), int(limite_minimo), -1):
+            t_teste = float(t)
+            
+            # Calcula o ganho proporcional de largura:
+            # Quanto menor a fonte, menor o perigo de colisão. Ganhamos folga para abrir a caixa.
+            proporcao_reducao = (tamanho_original - t_teste) / tamanho_original
+            compensacao_largura = (largura_original - largura_colisao) * (proporcao_reducao * 0.6)
+            largura_teste = min(largura_colisao + compensacao_largura, largura_original)
+            
+            # Estima se a maior palavra cabe sem estourar o limite da caixa lateralmente
+            largura_estimada_palavra = comprimento_maior_palavra * (t_teste * proporcao_caractere)
+            
+            if largura_estimada_palavra <= largura_teste:
+                tamanho_calculado = t_teste
+                largura_calculada = largura_teste
+                ajustado = True
+                break
+
+        # Caso o texto seja absurdamente longo e não caiba nem no limite mínimo
+        if not ajustado:
+            tamanho_calculado = limite_minimo
+            proporcao_reducao = (tamanho_original - limite_minimo) / tamanho_original
+            compensacao_largura = (largura_original - largura_colisao) * (proporcao_reducao * 0.6)
+            largura_calculada = min(largura_colisao + compensacao_largura, largura_original)
+
+        # 4. Gravação Final Única (O gargalo do COM é resolvido aqui)
+        # Enviamos as novas propriedades de uma só vez para o Photoshop aplicar e renderizar
+        text_item.Contents = texto
+        text_item.UseAutoLeading = False
+        text_item.Size = tamanho_calculado
+        text_item.Leading = tamanho_calculado * 1.12  # Entrelinha perfeita para evitar encavalamento
+        text_item.Width = largura_calculada
+        text_item.Height = altura_original
+
+        self.logger.info(
+            f"Slot atualizado: '{texto[:15]}...' | "
+            f"Fonte original {tamanho_original}pt -> Aplicada {tamanho_calculado}pt | "
+            f"Caixa original {largura_original}px -> Colisão/Ajuste {largura_calculada:.1f}px"
+        )
+
+    def fit_description_with_collision_v2(
+        self,
+        description_layer: Any,
+        group: Any,
+        offer_name: str,
+        *,
+        group_node: Optional[dict[str, Any]] = None,
+        preferred_font_scale: Optional[float] = None,
+        preferred_line_spacing_scale: float = 0.9,
+        min_scale: float = 0.45,
+        max_scale: float = 1.05,
+        min_margin: float = 5.0,
+        max_iterations: int = 14,
+        tolerance: float = 1.0,
+    ) -> dict[str, Any]:
+        report: dict[str, Any] = {
+            "success": False,
+            "original_font_size": None,
+            "final_font_size": None,
+            "final_text": offer_name,
+            "message": "",
+        }
+        try:
+            raw = self._get_layer_bounds(description_layer)
+            if not raw:
+                report["message"] = "Sem bounds da descrição"
+                return report
+
+            desc = Bounds(*raw)
+            largura_original = desc.width
+            altura_original = desc.height
+
+            # Determina o limite à direita baseado no slot ou nos elementos na mesma faixa vertical
+            price_left = self._find_closest_price_left(group, desc.left, group_node, desc_bounds=desc)
+            if price_left is not None and price_left > desc.left + 40.0:
+                right_limit = price_left - 7.0
+            else:
+                right_limit = desc.right + 220.0
+
+            for layer in self._get_visible_layers_in_group(group):
+                if layer is description_layer:
+                    continue
+                name = str(getattr(layer, "Name", "") or "").lower()
+                bounds = self._get_layer_bounds(layer)
+                if bounds is None:
+                    continue
+                is_price = any(
+                    token in name
+                    for token in ("preço", "preco", "r$", "por", "un", "kg", "ml", "pc", "badge", "price")
+                ) or (name.startswith("de") and (name == "de" or name.startswith("de:") or name.startswith("de;")))
+                if is_price:
+                    price_bounds = Bounds(*bounds)
+                    # CRÍTICO: Só restringe largura se houver SOBREPOSIÇÃO VERTICAL real (> 2px) e estiver à direita
+                    v_overlap = desc.vertical_overlap(price_bounds)
+                    if v_overlap > 2.0 and price_bounds.left > desc.left + 40.0:
+                        right_limit = min(right_limit, price_bounds.left - 7.0)
+
+            for layer in self._get_visible_layers_in_group(group):
+                if layer is description_layer:
+                    continue
+                name = str(getattr(layer, "Name", "") or "").lower()
+                if any(token in name for token in ("badge", "selo", "tag")):
+                    bounds = self._get_layer_bounds(layer)
+                    if bounds is not None:
+                        b_bounds = Bounds(*bounds)
+                        v_overlap = desc.vertical_overlap(b_bounds)
+                        if v_overlap > 2.0 and b_bounds.left > desc.left + 40.0:
+                            right_limit = min(right_limit, b_bounds.left - 7.0)
+
+            left_limit = desc.left
+            top_limit = desc.top - 8.0
+            bottom_limit = desc.bottom + 65.0
+            has_lower_blocker = False
+            for layer in self._get_visible_layers_in_group(group):
+                if layer is description_layer:
+                    continue
+                name = str(getattr(layer, "Name", "") or "").lower()
+                if not any(token in name for token in ("preço", "preco", "r$", "badge", "price", "valor")):
+                    continue
+                bounds = self._get_layer_bounds(layer)
+                if bounds is not None:
+                    price_bounds = Bounds(*bounds)
+                    h_overlap = desc.horizontal_overlap(price_bounds)
+                    if price_bounds.top > desc.top and (h_overlap > 0 or abs(price_bounds.left - desc.left) < 60.0):
+                        bottom_limit = min(bottom_limit, price_bounds.top - 7.0)
+                        has_lower_blocker = True
+
+            # Garante que right_limit nunca seja menor que desc.left + 85.0
+            right_limit = max(right_limit, left_limit + 85.0)
+            available_width = right_limit - left_limit
+            safe_width = max(85.0, available_width)
+            safe_height = max(35.0, bottom_limit - top_limit)
+            if not has_lower_blocker:
+                safe_height = max(78.0, safe_height)
+
+            # Executa o ajuste ultra-veloz em memória (sem loops de COM)
+            self.aplicar_texto_com_ajuste_veloz(
+                layer=description_layer,
+                texto=offer_name,
+                largura_colisao=safe_width,
+                largura_original=largura_original,
+                altura_original=safe_height,
+            )
+
+            report["success"] = True
+            report["message"] = "OK"
+            report["final_text"] = offer_name
+            try:
+                report["final_font_size"] = float(description_layer.TextItem.Size)
+            except Exception:
+                pass
+            return report
+        except Exception as exc:
+            report["message"] = str(exc)
+            logger.exception("Erro em fit_description_with_collision_v2: %s", exc)
+            return report
 
     @staticmethod
     def _make_save_options(format_name: str) -> Any:
@@ -785,12 +1800,15 @@ class PhotoshopEngine:
                 logger.warning("Photoshop document not open for slot %s", target_slot)
                 return False
 
-            group = self._find_slot_group(doc, int(target_slot))
+            group_node = self._native_slot_node(int(target_slot))
+            group = self._layer_from_native_node(group_node) or self._find_slot_group(doc, int(target_slot))
             if group is None:
                 logger.warning("Could not find PSD slot group for slot %s", target_slot)
                 return False
 
-            product_name = getattr(offer, "nome", "") or ""
+            product_name = self.description_recommendations.get(
+                int(target_slot), getattr(offer, "nome", "") or ""
+            )
             changed = False
             shape_references = self._shape_references(group)
             price_group = self._find_price_group(group)
@@ -798,36 +1816,54 @@ class PhotoshopEngine:
             price_layers = self._text_layers(price_container)
             description_bounds = None
             if product_name:
-                description_layer = self._find_description_layer(group)
+                structured_description = self._native_description_node(group_node)
+                description_layer = (
+                    self._layer_from_native_node(structured_description)
+                    if structured_description is not None
+                    else None
+                ) or self._find_description_layer(group)
                 if description_layer is not None:
                     description_bounds = self._bounds_signature(description_layer)
                     blocking_bounds = self._description_blockers(group, description_layer)
-                    changed = self._apply_text_value(description_layer, product_name) or changed
-                    if description_bounds is not None and shape_references:
+                    if description_bounds is not None:
                         try:
-                            description_shape = min(
-                                shape_references,
-                                key=lambda shape: (
-                                    ((shape[0] + shape[2]) / 2.0 - (description_bounds[0] + description_bounds[2]) / 2.0) ** 2
-                                    + ((shape[1] + shape[3]) / 2.0 - (description_bounds[1] + description_bounds[3]) / 2.0) ** 2
-                                ),
-                            )
-                            description_shape_center_x = (description_shape[0] + description_shape[2]) / 2.0
-                            safe_description_shape = self._description_safe_bounds(
-                                description_bounds,
-                                description_shape,
-                                blocking_bounds,
-                            )
-                            self._fit_text_to_bounds(
-                                description_layer,
-                                safe_description_shape,
-                                description_bounds,
-                                horizontal_center=(safe_description_shape[0] + safe_description_shape[2]) / 2.0,
-                                blocking_bounds=blocking_bounds,
-                            )
+                            try:
+                                result = self.fit_description_with_collision_v2(
+                                    description_layer,
+                                    group,
+                                    product_name,
+                                    group_node=group_node,
+                                    preferred_font_scale=self.description_font_scales.get(int(target_slot)),
+                                    preferred_line_spacing_scale=self.description_line_spacing_scales.get(int(target_slot), 0.9),
+                                    min_scale=0.45,
+                                    max_scale=1.05,
+                                    min_margin=5.0,
+                                    max_iterations=14,
+                                    tolerance=1.0,
+                                )
+                                changed = True
+                                if not result.get("success", False):
+                                    logger.warning(
+                                        "Slot %s description fallback warning: %s",
+                                        target_slot,
+                                        result.get("message", "Ajuste não concluído"),
+                                    )
+                            except Exception as exc:
+                                logger.warning("Could not use v2 collision fit for layer '%s': %s", getattr(description_layer, "Name", ""), exc)
+                                self._fit_description_layer_with_collision(
+                                    group,
+                                    description_layer,
+                                    description_bounds,
+                                    shape_references,
+                                    blocking_bounds,
+                                    target_slot,
+                                )
+                                changed = True
                             description_bounds = self._bounds_signature(description_layer) or description_bounds
                         except Exception as exc:
                             logger.warning("Could not fit description layer '%s': %s", getattr(description_layer, "Name", ""), exc)
+                    else:
+                        changed = self._apply_text_value(description_layer, product_name) or changed
                 else:
                     logger.warning("No description text layer found in slot %s", target_slot)
 

@@ -8,6 +8,9 @@ from .psd_template_inspector import PsdTemplateInspector
 from .template_manager import TemplateInfo, TemplateManager
 from .validator import ValidationResult, Validator
 from .workflow import GenerationResult, GenerationWorkflow
+from .intelligent_inspector import IntelligentInspector, DocumentAnalysis, GroupAnalysis, LayerInfo
+from .ai_provider import AIProvider
+from .ai_generator import AIOfferGenerator
 
 __all__ = [
     "DataLoader",
@@ -25,4 +28,10 @@ __all__ = [
     "Validator",
     "GenerationResult",
     "GenerationWorkflow",
+    "IntelligentInspector",
+    "DocumentAnalysis",
+    "GroupAnalysis",
+    "LayerInfo",
+    "AIProvider",
+    "AIOfferGenerator",
 ]

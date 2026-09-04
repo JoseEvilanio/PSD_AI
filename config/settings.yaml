@@ -12,3 +12,17 @@ photoshop:
 export:
   format: JPG
   quality: 90
+
+ai:
+  enabled: true
+  provider: ollama
+  base_url: http://localhost:11434
+  model: llama3.2
+  timeout: 60
+
+ollama:
+  enabled: true
+  host: http://localhost:11434
+  model: llama3.2
+  temperature: 0.3
+  timeout: 60
