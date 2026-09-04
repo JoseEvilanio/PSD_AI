@@ -1,0 +1,54 @@
+<UserControl x:Class="Autoflyer.Wpf.Views.PhotoshopLoadingOverlay"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" 
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008" 
+             mc:Ignorable="d" 
+             d:DesignHeight="350" d:DesignWidth="500">
+    <Grid Background="#CC000000">
+        <!-- Modal Card Centralizado -->
+        <Border Width="450" Height="320"
+                Background="#1E1E1E"
+                BorderBrush="#434343"
+                BorderThickness="2"
+                CornerRadius="6"
+                HorizontalAlignment="Center"
+                VerticalAlignment="Center">
+            <Border.Effect>
+                <DropShadowEffect Color="#000000" BlurRadius="25" ShadowDepth="4" Opacity="0.8" />
+            </Border.Effect>
+
+            <Grid Margin="15">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <!-- Canvas de Animação Vetorial do Photoshop -->
+                <Canvas x:Name="AnimCanvas" Grid.Row="0" Width="380" Height="180"
+                        HorizontalAlignment="Center" VerticalAlignment="Center"
+                        ClipToBounds="True" />
+
+                <!-- Texto de Etapa Dinâmica -->
+                <TextBlock Grid.Row="1"
+                           Text="{Binding LoadingStage, FallbackValue='Renderizando encarte no Photoshop...'}"
+                           Foreground="#FFFFFF"
+                           FontSize="14"
+                           FontWeight="Bold"
+                           TextAlignment="Center"
+                           TextWrapping="Wrap"
+                           Margin="0,10,0,5" />
+
+                <!-- Subtexto informativo -->
+                <TextBlock Grid.Row="2"
+                           Text="Por favor, não feche a janela do Adobe Photoshop."
+                           Foreground="#888888"
+                           FontSize="11"
+                           FontStyle="Italic"
+                           TextAlignment="Center"
+                           Margin="0,0,0,10" />
+            </Grid>
+        </Border>
+    </Grid>
+</UserControl>
